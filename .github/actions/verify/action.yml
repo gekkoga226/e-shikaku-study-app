@@ -1,0 +1,38 @@
+name: コード検査
+description: >
+  Apps Scriptソースの構文検査・既存Pythonテスト・機密情報混入チェック・
+  必須ファイル確認をまとめて実行する。CIとデプロイの両方から使う。
+
+runs:
+  using: composite
+  steps:
+    - name: Node.js 20 を用意する
+      uses: actions/setup-node@v5
+      with:
+        node-version: '20'
+        cache: npm
+
+    - name: Python 3.11 を用意する
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
+
+    - name: 依存パッケージをインストールする
+      shell: bash
+      run: npm ci --no-audit --no-fund
+
+    - name: Apps Script 必須ファイル確認
+      shell: bash
+      run: npm run check:files
+
+    - name: 構文検査（.gs / HTML内JavaScript / appsscript.json）
+      shell: bash
+      run: npm run check:syntax
+
+    - name: 機密情報混入チェック
+      shell: bash
+      run: npm run check:secrets
+
+    - name: Pythonテスト
+      shell: bash
+      run: npm run test:python

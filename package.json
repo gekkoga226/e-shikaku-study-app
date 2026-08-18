@@ -1,0 +1,25 @@
+{
+  "name": "e-shikaku-study-app",
+  "version": "2.0.0",
+  "private": true,
+  "description": "E資格 学習Webアプリ（Google Apps Script）のGitHub自動デプロイ構成",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "verify": "npm run check:files && npm run check:syntax && npm run check:secrets && npm run test:python",
+    "check:files": "bash scripts/check-required-files.sh",
+    "check:syntax": "node scripts/check-gas-syntax.mjs",
+    "check:secrets": "bash scripts/check-secrets.sh",
+    "test:python": "python3 -m unittest discover -s tests -p \"test_*.py\" -v",
+    "test": "npm run verify",
+    "clasp": "clasp",
+    "push": "clasp push -f",
+    "deploy": "bash scripts/deploy.sh",
+    "bootstrap": "bash scripts/bootstrap-smartphone.sh"
+  },
+  "devDependencies": {
+    "@google/clasp": "3.3.0"
+  }
+}

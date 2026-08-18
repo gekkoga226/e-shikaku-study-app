@@ -1,0 +1,19 @@
+# clasp が Apps Script へ送るファイルの許可リスト。
+#
+# 重要:
+#   .claspignore が存在すると clasp の既定ルールは使われず、
+#   このファイルの内容だけが使われます。
+#   そのため「いったん全部除外 → 必要なものだけ許可」の書き方にしています。
+#
+# パターンは .clasp.json の rootDir（= src/）からの相対パスです。
+
+**/**
+
+!appsscript.json
+!Code.gs
+!ImageManifest.gs
+!ImageSupport.gs
+!ImageSelfTest.gs
+!Index.html
+!Styles.html
+!Client.html

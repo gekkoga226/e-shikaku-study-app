@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <?!= include('Styles'); ?>
+</head>
+<body>
+  <header class="app-header">
+    <div>
+      <div class="eyebrow">E資格 2週間合格</div>
+      <h1>学習アプリ</h1>
+    </div>
+    <button id="homeBtn" class="ghost-btn" type="button">ホーム</button>
+  </header>
+
+  <main class="app-shell">
+    <section id="homeView" class="view">
+      <div class="hero-card">
+        <div>
+          <div class="eyebrow">現在の学習状況</div>
+          <h2 id="ruleLabel">理解度を読み込み中...</h2>
+        </div>
+        <button id="startBtn" class="primary-btn big" type="button">弱点から1問解く</button>
+        <button id="reviewBtn" class="secondary-btn" type="button">期限到来の復習をする</button>
+      </div>
+
+      <div id="dashboardGrid" class="metric-grid"></div>
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>弱い論点</h2>
+          <span class="muted">理解度が低い順</span>
+        </div>
+        <div id="weaknessList" class="weakness-list"></div>
+      </section>
+    </section>
+
+    <section id="questionView" class="view hidden">
+      <div id="questionLoading" class="panel centered hidden">
+        <div class="spinner" aria-hidden="true"></div>
+        <h2>問題を準備しています</h2>
+        <p id="loadingMessage" class="muted">安全に表示できるか確認中です。</p>
+      </div>
+
+      <article id="questionCard" class="panel hidden">
+        <div class="question-meta">
+          <span id="topicBadge" class="badge"></span>
+          <span id="masteryBadge" class="badge subtle"></span>
+        </div>
+
+        <h2 id="questionText" class="question-text"></h2>
+        <div id="questionImages" class="question-images"></div>
+        <div id="optionsArea" class="options-area"></div>
+
+        <div class="confidence-box">
+          <div class="confidence-title">この回答への自信</div>
+          <div class="confidence-options">
+            <label><input type="radio" name="confidence" value="1"> 1 自信なし</label>
+            <label><input type="radio" name="confidence" value="2"> 2 少し自信</label>
+            <label><input type="radio" name="confidence" value="3"> 3 自信あり</label>
+          </div>
+        </div>
+
+        <button id="submitBtn" class="primary-btn big" type="button" disabled>回答する</button>
+      </article>
+
+      <article id="resultCard" class="panel hidden">
+        <div id="resultMark" class="result-mark"></div>
+        <h2 id="resultTitle"></h2>
+        <div id="answerSummary" class="answer-summary"></div>
+        <div id="masteryChange" class="mastery-change"></div>
+        <div id="explanationBox" class="explanation-box"></div>
+        <div class="result-actions">
+          <button id="nextBtn" class="primary-btn big" type="button">次の問題</button>
+          <button id="resultHomeBtn" class="secondary-btn" type="button">ホームへ戻る</button>
+        </div>
+      </article>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <div id="lightbox" class="lightbox hidden" role="dialog" aria-modal="true" aria-label="画像を拡大表示">
+    <button id="lightboxClose" class="lightbox-close" type="button">閉じる</button>
+    <img id="lightboxImage" alt="拡大画像">
+  </div>
+
+  <?!= include('Client'); ?>
+</body>
+</html>

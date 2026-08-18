@@ -1,0 +1,26 @@
+※ このファイルは、もとの配布ZIPに入っていたファイル一覧です。
+※ GitHub自動デプロイ版では、Apps Scriptへ送るファイルは src/ にまとめています。
+※ 手作業でのコピー＆ペーストは不要です。SMARTPHONE_SETUP.md を参照してください。
+
+E資格 学習Webアプリ 完全版 v2
+
+最初に読む:
+1. START_HERE.md
+2. INSTALL_非エンジニア向け.md
+3. TEST_CHECKLIST.md
+
+Apps Scriptへコピーする本体:
+1. Code.gs
+2. ImageManifest.gs
+3. ImageSupport.gs
+4. ImageSelfTest.gs
+5. Index.html
+6. Styles.html
+7. Client.html
+
+任意:
+- appsscript.json（設定例。通常は触らなくてOK）
+- README.md
+- TEST_REPORT.md
+- data/image_audit.csv
+- tests/test_package.py
