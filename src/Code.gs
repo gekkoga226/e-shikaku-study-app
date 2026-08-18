@@ -595,29 +595,48 @@ function callGeminiGenerateContent_(model, apiKey, parts) {
       muteHttpExceptions: true
     });
   } catch (e) {
-    return aiFailure_('AI_NETWORK_ERROR', 'AIサービスへ接続できませんでした。時間をおいて、もう一度お試しください。');
+    // 例外の中身を捨てると原因が分からなくなる。キーは含まれないので、そのまま残す。
+    const detail = aiErrorText_(e);
+    console.error('Gemini呼び出しで例外が発生しました: ' + detail);
+    if (/permission|scope|authoriz|権限/i.test(detail)) {
+      return aiFailure_(
+        'AI_NOT_AUTHORIZED',
+        '外部サービスへの接続がまだ承認されていません。Apps Scriptエディタで checkAiSetup を1度実行し、表示される権限を承認してください。' + aiDetailSuffix_(detail)
+      );
+    }
+    return aiFailure_(
+      'AI_NETWORK_ERROR',
+      'AIサービスへ接続できませんでした。時間をおいて、もう一度お試しください。' + aiDetailSuffix_(detail)
+    );
   }
 
   const status = response.getResponseCode();
+  const rawBody = response.getContentText();
+  // Gemini はエラー理由を本文に入れてくる。これを隠すと設定ミスの特定ができない。
+  const apiDetail = aiDetailSuffix_(aiApiErrorMessage_(rawBody));
+  if (status < 200 || status >= 300) {
+    console.error('Gemini がエラーを返しました（HTTP ' + status + '）: ' + aiApiErrorMessage_(rawBody));
+  }
+
   if (status === 400) {
-    return aiFailure_('AI_BAD_REQUEST', 'AIサービスがリクエストを受け付けませんでした。GEMINI_MODEL の設定を確認してください。');
+    return aiFailure_('AI_BAD_REQUEST', 'AIサービスがリクエストを受け付けませんでした。GEMINI_MODEL の設定を確認してください。' + apiDetail);
   }
   if (status === 401 || status === 403) {
-    return aiFailure_('AI_AUTH_ERROR', 'APIキーが正しくないか、権限がありません。GEMINI_API_KEY を確認してください。');
+    return aiFailure_('AI_AUTH_ERROR', 'APIキーが正しくないか、権限がありません。GEMINI_API_KEY を確認してください。' + apiDetail);
   }
   if (status === 404) {
-    return aiFailure_('AI_MODEL_NOT_FOUND', 'モデルを利用できませんでした。GEMINI_MODEL の設定を確認してください。');
+    return aiFailure_('AI_MODEL_NOT_FOUND', 'モデルを利用できませんでした。GEMINI_MODEL の設定を確認してください。' + apiDetail);
   }
   if (status === 429) {
-    return aiFailure_('AI_RATE_LIMITED', 'AIの利用上限に達しました。少し時間をおいてからお試しください。');
+    return aiFailure_('AI_RATE_LIMITED', 'AIの利用上限に達しました。少し時間をおいてからお試しください。' + apiDetail);
   }
   if (status < 200 || status >= 300) {
-    return aiFailure_('AI_HTTP_ERROR', 'AIサービスがエラーを返しました（HTTP ' + status + '）。');
+    return aiFailure_('AI_HTTP_ERROR', 'AIサービスがエラーを返しました（HTTP ' + status + '）。' + apiDetail);
   }
 
   let data;
   try {
-    data = JSON.parse(response.getContentText());
+    data = JSON.parse(rawBody);
   } catch (e) {
     return aiFailure_('AI_BAD_RESPONSE', 'AIの応答を読み取れませんでした。');
   }
@@ -667,6 +686,58 @@ function aiPick_(obj, names) {
 
 function aiFailure_(code, message) {
   return { ok: false, error_code: String(code), message: String(message) };
+}
+
+function aiErrorText_(e) {
+  if (!e) return '';
+  if (e.message) return String(e.message);
+  return String(e);
+}
+
+/** Gemini のエラー本文から人が読める理由だけを取り出す。 */
+function aiApiErrorMessage_(rawBody) {
+  try {
+    const parsed = JSON.parse(String(rawBody || ''));
+    const error = parsed.error || {};
+    return String(error.message || '');
+  } catch (e) {
+    return '';
+  }
+}
+
+/** 画面へ出す補足。長すぎる技術文はここで切り詰める。 */
+function aiDetailSuffix_(detail) {
+  const text = String(detail || '').trim();
+  if (!text) return '';
+  const trimmed = text.length > 300 ? text.slice(0, 300) + '…' : text;
+  return '（詳細: ' + trimmed + '）';
+}
+
+/**
+ * AI補助解説の設定を、Apps Scriptエディタから1回で点検する。
+ * 学習データには一切触れず、権限の承認とキー・モデルの確認だけを行う。
+ * エディタの「実行」から呼ぶと、不足している権限の承認画面が出る。
+ */
+function checkAiSetup() {
+  const properties = PropertiesService.getScriptProperties();
+  const apiKey = properties.getProperty(AI_CONFIG.API_KEY_PROPERTY);
+  const model = String(properties.getProperty(AI_CONFIG.MODEL_PROPERTY) || '').trim() || AI_CONFIG.DEFAULT_MODEL;
+
+  if (!apiKey) {
+    console.error('GEMINI_API_KEY がスクリプトプロパティに登録されていません。');
+    return { ok: false, error_code: 'AI_KEY_NOT_CONFIGURED' };
+  }
+  // 鍵そのものは出さず、登録されている事実だけを記録する。
+  console.log('GEMINI_API_KEY: 登録済み（' + String(apiKey).length + '文字）');
+  console.log('GEMINI_MODEL: ' + model);
+
+  const result = callGeminiGenerateContent_(model, apiKey, [{ text: '接続確認です。「OK」とだけ返してください。' }]);
+  if (result.ok) {
+    console.log('Gemini への接続に成功しました。応答: ' + result.text);
+  } else {
+    console.error('Gemini への接続に失敗しました: ' + result.error_code + ' / ' + result.message);
+  }
+  return result;
 }
 
 /* ----------------------------- internal helpers ----------------------------- */
