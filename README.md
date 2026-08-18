@@ -26,6 +26,11 @@ E資格の勉強用 学習Webアプリ（Google Apps Script）と、
 対象スプレッドシート: `E資格_学習履歴管理シート_MVP`
 理解度ルール: `mastery_rule_version = v2_2026-08-16`
 
+回答後の画面には、押したときだけ動く **AI補助解説（Gemini）** があります。
+出題・採点・理解度・学習ログはAIを一切使わず、これまでどおりスプレッドシートの
+確定ロジックだけで決まります。使い始めるための1回だけの設定は
+**[docs/AI_SETUP_非エンジニア向け.md](docs/AI_SETUP_非エンジニア向け.md)** を読んでください。
+
 ---
 
 ## 2. フォルダ構成
@@ -34,7 +39,7 @@ E資格の勉強用 学習Webアプリ（Google Apps Script）と、
 .
 ├── src/                      Apps Scriptへ送るファイル（これだけが送られます）
 │   ├── appsscript.json       Apps Scriptの設定（webapp: MYSELF / USER_DEPLOYING）
-│   ├── Code.gs               出題・採点・ログ書き込みの司令塔
+│   ├── Code.gs               出題・採点・ログ書き込みの司令塔＋AI補助解説
 │   ├── ImageManifest.gs      どの画像が問題画像／選択肢画像かの設計図
 │   ├── ImageSupport.gs       Drive ZIPから画像を安全に取り出す部品
 │   ├── ImageSelfTest.gs      画像機能の非破壊テスト
@@ -54,6 +59,7 @@ E資格の勉強用 学習Webアプリ（Google Apps Script）と、
 │   ├── test_mastery_rules.py    理解度v2の守り
 │   ├── test_image_policy.py     画像必須ルールの守り
 │   ├── test_answer_secrecy.py   正解漏洩防止の守り
+│   ├── test_ai_explanation.py   AI補助解説の守り（回答後だけ／キー非公開）
 │   └── test_repo_config.py      設定・権限・ワークフローの守り
 │
 ├── .github/

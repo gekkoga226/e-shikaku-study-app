@@ -71,6 +71,21 @@
         <div id="answerSummary" class="answer-summary"></div>
         <div id="masteryChange" class="mastery-change"></div>
         <div id="explanationBox" class="explanation-box"></div>
+
+        <section class="ai-panel">
+          <div class="ai-head">
+            <h3 class="ai-title">AI補助解説</h3>
+            <span class="muted">押したときだけAIを呼びます</span>
+          </div>
+          <p class="ai-note">
+            採点・理解度・学習ログは、これまでどおりスプレッドシートの確定ロジックだけで決まります。
+            AIは上の登録解説を言い換えて補助するだけで、正誤や理解度は変えません。
+          </p>
+          <button id="aiExplainBtn" class="secondary-btn" type="button">AIでさらに噛み砕く</button>
+          <div id="aiStatus" class="ai-status muted hidden" role="status"></div>
+          <div id="aiExplanationBox" class="ai-explanation-box hidden"></div>
+        </section>
+
         <div class="result-actions">
           <button id="nextBtn" class="primary-btn big" type="button">次の問題</button>
           <button id="resultHomeBtn" class="secondary-btn" type="button">ホームへ戻る</button>

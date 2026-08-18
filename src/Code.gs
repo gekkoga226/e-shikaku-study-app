@@ -239,6 +239,7 @@ function submitAnswer(payload) {
 
     return {
       ok: true,
+      attempt_id: attemptId,
       question_id: qid,
       is_correct: isCorrect,
       correct_answer: correct,
@@ -307,6 +308,365 @@ function runSelfTest() {
   } catch (e) {
     return { ok: false, results, error: String(e && e.message ? e.message : e) };
   }
+}
+
+/* --------------------------- AI補助解説（Gemini） ---------------------------
+ *
+ * 役割の境界（ここを越えない）:
+ * - 出題・採点・理解度・学習ログは、これまでどおり既存の確定ロジックだけが担当する。
+ * - この節が扱うのは「すでに採点が終わった1回の回答」を、あとから言い換えることだけ。
+ * - 02_マインドマップ / 04_学習ログ へは一切書き込まない（読むだけ）。
+ * - APIキーはスクリプトプロパティからのみ読み、クライアントへは絶対に返さない。
+ * - 04_学習ログに write_status=success の回答が実在するときだけ動く。
+ *   （回答前に呼ばれても、正解や解説を1文字も返さない）
+ */
+
+const AI_CONFIG = Object.freeze({
+  API_KEY_PROPERTY: 'GEMINI_API_KEY',
+  MODEL_PROPERTY: 'GEMINI_MODEL',
+  DEFAULT_MODEL: 'gemini-3.5-flash',
+  ENDPOINT_BASE: 'https://generativelanguage.googleapis.com/v1beta/models/',
+  CACHE_PREFIX: 'aiexpl:',
+  CACHE_SECONDS: 3600,
+  MAX_CACHE_CHARS: 90000,
+  MAX_IMAGE_PARTS: 8,
+  MAX_OUTPUT_TOKENS: 1600,
+  TEMPERATURE: 0.3
+});
+
+const AI_DISCLAIMER = 'AI補助解説は説明の言い換えだけを行います。正誤判定・理解度・学習ログはスプレッドシートの確定ロジックが決めており、AIは一切変更しません。';
+
+const AI_SYSTEM_INSTRUCTION = [
+  'あなたは、E資格を独学している非エンジニアの学習者に付き添う家庭教師です。',
+  'すでに採点が終わった1問について、あとから噛み砕いて説明することだけが仕事です。',
+  '',
+  '絶対に守ること:',
+  '- 採点結果と「登録されている正解」は確定済みの事実です。これを絶対基準として扱い、',
+  '  あなたの判断で正解を変更・否定・訂正してはいけません。',
+  '  もし解説に疑問があっても、正解は登録どおりであるという前提で説明を組み立ててください。',
+  '- あなたは採点をしません。理解度（%）やスコアを新しく作らないでください。',
+  '- 学習者は非エンジニアです。専門用語をいきなり使わず、まず日常のことばで言い換え、',
+  '  そのあとに正式な用語を出してください。',
+  '  例:「数字を縦横に並べた表」→「これを正式には行列（matrix）と呼びます」',
+  '- 数式は最小限にし、使うときは記号の意味を日本語で説明してください。',
+  '- 与えられた情報に書かれていないことは推測で断定せず、',
+  '  「登録された解説にはここまでしか書かれていません」と正直に述べてください。',
+  '- 画像が渡された場合は、その画像に実際に写っているものだけを根拠にしてください。',
+  '',
+  '出力の構成（この見出しをそのまま使い、この順番で書く）:',
+  '【まず一言】',
+  '【なぜそうなる？】',
+  '【他の選択肢との違い】',
+  '【覚え方】',
+  '',
+  '全体で日本語800〜1200文字程度。箇条書きを適度に使い、読みやすくしてください。'
+].join('\n');
+
+/**
+ * 回答後の補助解説だけをAIへ依頼する。
+ *
+ * request: { attemptId: "ATT-WEB-..." }
+ *
+ * 返り値（成功）: { ok:true, attempt_id, model, text, cached, disclaimer }
+ * 返り値（失敗）: { ok:false, error_code, message }
+ * どちらの場合もAPIキーは含めない。
+ */
+function getAiExplanation(request) {
+  request = request || {};
+  const attemptId = String(request.attemptId || '').trim();
+  if (!attemptId) {
+    return aiFailure_('MISSING_ATTEMPT_ID', 'AI解説を出すには、どの回答についてかを示すIDが必要です。');
+  }
+
+  // 同じattemptの解説は1時間キャッシュし、連打でAPI使用量が増えないようにする。
+  // このキャッシュはユーザー単位で、回答済みの確認を通ったあとにしか書かれない。
+  // つまりキャッシュに存在する時点で「回答済み」が保証されている。
+  const cacheKey = AI_CONFIG.CACHE_PREFIX + attemptId;
+  const cached = aiCacheGet_(cacheKey);
+  if (cached && cached.text) {
+    return {
+      ok: true,
+      attempt_id: attemptId,
+      model: String(cached.model || ''),
+      text: String(cached.text),
+      cached: true,
+      disclaimer: AI_DISCLAIMER
+    };
+  }
+
+  // ここを通らない限り、正解も解説も1文字も外へ出さない。
+  const found = readAnsweredAttempt_(attemptId);
+  if (!found.ok) return found;
+
+  const properties = PropertiesService.getScriptProperties();
+  const apiKey = properties.getProperty(AI_CONFIG.API_KEY_PROPERTY);
+  if (!apiKey) {
+    return aiFailure_(
+      'AI_KEY_NOT_CONFIGURED',
+      'GEMINI_API_KEY がスクリプトプロパティに登録されていません。Apps Scriptのプロジェクト設定から登録してください。'
+    );
+  }
+
+  const model = String(properties.getProperty(AI_CONFIG.MODEL_PROPERTY) || '').trim() || AI_CONFIG.DEFAULT_MODEL;
+  const parts = buildAiPromptParts_(found.attempt, found.question);
+  const generated = callGeminiGenerateContent_(model, apiKey, parts);
+  if (!generated.ok) return generated;
+
+  aiCachePut_(cacheKey, { model: model, text: generated.text });
+
+  return {
+    ok: true,
+    attempt_id: attemptId,
+    model: model,
+    text: generated.text,
+    cached: false,
+    disclaimer: AI_DISCLAIMER
+  };
+}
+
+/**
+ * 04_学習ログに write_status=success で記録済みの回答だけを認める。
+ * 見つからなければ、正解に関する情報を含めずに失敗を返す。
+ */
+function readAnsweredAttempt_(attemptId) {
+  const ss = SpreadsheetApp.openById(APP_CONFIG.SPREADSHEET_ID);
+  const logSheet = ss.getSheetByName(APP_CONFIG.SHEETS.LOG);
+  if (!logSheet) {
+    return aiFailure_('LOG_SHEET_NOT_FOUND', '学習ログを読み取れませんでした。');
+  }
+
+  const attempt = findObjectById_(logSheet, 'attempt_id', attemptId);
+  if (!attempt) {
+    return aiFailure_('ATTEMPT_NOT_FOUND', 'この回答は学習ログに存在しません。先に問題へ回答してください。');
+  }
+
+  if (String(attempt.write_status || '').trim().toLowerCase() !== 'success') {
+    return aiFailure_('ATTEMPT_NOT_SUCCESS', '回答の記録が完了していないため、AI解説は出せません。');
+  }
+
+  const userAnswer = String(aiPick_(attempt, ['user_answer', 'user_option', 'selected_option']) || '')
+    .trim().toUpperCase();
+  if (!/^[A-H]$/.test(userAnswer)) {
+    return aiFailure_('ATTEMPT_NOT_ANSWERED', 'この記録にはまだ選択した回答が入っていません。');
+  }
+
+  const qid = String(attempt.question_id || '').trim();
+  if (!qid) {
+    return aiFailure_('ATTEMPT_WITHOUT_QUESTION', 'この記録には問題IDがありません。');
+  }
+
+  const qSheet = ss.getSheetByName(APP_CONFIG.SHEETS.QUESTIONS);
+  const question = findObjectById_(qSheet, 'question_id', qid);
+  if (!question) {
+    return aiFailure_('QUESTION_NOT_FOUND', '対象の問題を03_問題台帳から読み取れませんでした。');
+  }
+
+  return { ok: true, attempt: attempt, question: question };
+}
+
+/**
+ * Geminiへ渡す parts を組み立てる。
+ * 先頭にテキスト、必要なら既存の画像取得を再利用して inline_data を続ける。
+ */
+function buildAiPromptParts_(attempt, question) {
+  const letters = availableOptionLetters_(question);
+  const correct = String(question.correct_option || '').trim().toUpperCase();
+  const userAnswer = String(aiPick_(attempt, ['user_answer', 'user_option', 'selected_option']) || '')
+    .trim().toUpperCase();
+  const isCorrect = userAnswer === correct;
+
+  const lines = [];
+  lines.push('■ 状況（すでに採点済み）');
+  lines.push('採点はスプレッドシートの確定ロジックが行い、結果は変更されません。');
+  lines.push('学習者が選んだ選択肢: ' + userAnswer);
+  lines.push('登録されている正解（絶対基準・変更禁止）: ' + correct);
+  lines.push('採点結果: ' + (isCorrect ? '正解' : '不正解'));
+  lines.push('学習者の自信度(1〜3): ' + String(attempt.confidence || ''));
+  lines.push('');
+
+  lines.push('■ 論点ID');
+  lines.push(String(question.primary_node_id || '（未設定）'));
+  lines.push('');
+
+  lines.push('■ 問題文');
+  lines.push(String(question.question_text || '（本文なし）'));
+  lines.push('');
+
+  lines.push('■ 選択肢');
+  letters.forEach(letter => {
+    const body = String(question['option_' + letter.toLowerCase()] || '').trim();
+    lines.push(letter + ': ' + (body || '（本文なし・画像のみ）'));
+  });
+  lines.push('');
+
+  const registered = [
+    ['やさしい解説', question.explanation_plain],
+    ['正式な解説', question.explanation_formal],
+    ['計算の解説', question.explanation_calculation],
+    ['選択肢ごとの解説', question.explanation_options]
+  ].filter(pair => String(pair[1] || '').trim());
+
+  lines.push('■ すでに登録されている解説（これと矛盾しないこと）');
+  if (registered.length) {
+    registered.forEach(pair => {
+      lines.push('- ' + pair[0] + ': ' + String(pair[1]).trim());
+    });
+  } else {
+    lines.push('- 登録された解説はありません。問題文と選択肢と正解だけを根拠にしてください。');
+  }
+  lines.push('');
+
+  lines.push('■ 依頼');
+  lines.push('上の内容を、非エンジニアの学習者にも分かるように噛み砕いて説明してください。');
+  lines.push('正解は登録どおりです。別の選択肢が正しいという説明はしないでください。');
+
+  const parts = [{ text: lines.join('\n') }];
+  appendAiImageParts_(parts, question);
+  return parts;
+}
+
+/**
+ * 画像問題では既存の getQuestionImageBundle を内部で再利用し、inline_data として渡す。
+ * 画像を取得できなくても、回答済みならテキストだけで解説を試みる。
+ */
+function appendAiImageParts_(parts, question) {
+  const qid = String(question.question_id || '');
+  if (!String(question.question_image_refs || '').trim()) return parts;
+
+  try {
+    const bundle = getQuestionImageBundle(qid);
+    if (!bundle || !bundle.ok) return parts;
+
+    let used = 0;
+    (bundle.question_images || []).forEach((image, index) => {
+      if (used >= AI_CONFIG.MAX_IMAGE_PARTS) return;
+      const inline = aiInlineDataFromDataUrl_(image.data_url);
+      if (!inline) return;
+      parts.push({ text: '■ 問題画像 ' + (index + 1) });
+      parts.push(inline);
+      used += 1;
+    });
+
+    Object.keys(bundle.option_images || {}).sort().forEach(letter => {
+      (bundle.option_images[letter] || []).forEach(image => {
+        if (used >= AI_CONFIG.MAX_IMAGE_PARTS) return;
+        const inline = aiInlineDataFromDataUrl_(image.data_url);
+        if (!inline) return;
+        parts.push({ text: '■ 選択肢 ' + letter + ' の画像' });
+        parts.push(inline);
+        used += 1;
+      });
+    });
+  } catch (e) {
+    console.warn('AI解説への画像添付を省略しました: ' + qid);
+  }
+
+  return parts;
+}
+
+function aiInlineDataFromDataUrl_(dataUrl) {
+  const match = String(dataUrl || '').match(/^data:([a-zA-Z0-9.+/-]+);base64,(.+)$/);
+  if (!match) return null;
+  return { inline_data: { mime_type: match[1], data: match[2] } };
+}
+
+/**
+ * Gemini API をApps Scriptサーバー側から呼ぶ。
+ * キーは x-goog-api-key ヘッダーで送り、URLにもレスポンスにも残さない。
+ */
+function callGeminiGenerateContent_(model, apiKey, parts) {
+  const url = AI_CONFIG.ENDPOINT_BASE + encodeURIComponent(model) + ':generateContent';
+  const payload = {
+    system_instruction: { parts: [{ text: AI_SYSTEM_INSTRUCTION }] },
+    contents: [{ role: 'user', parts: parts }],
+    generationConfig: {
+      temperature: AI_CONFIG.TEMPERATURE,
+      maxOutputTokens: AI_CONFIG.MAX_OUTPUT_TOKENS
+    }
+  };
+
+  let response;
+  try {
+    response = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { 'x-goog-api-key': apiKey },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+  } catch (e) {
+    return aiFailure_('AI_NETWORK_ERROR', 'AIサービスへ接続できませんでした。時間をおいて、もう一度お試しください。');
+  }
+
+  const status = response.getResponseCode();
+  if (status === 400) {
+    return aiFailure_('AI_BAD_REQUEST', 'AIサービスがリクエストを受け付けませんでした。GEMINI_MODEL の設定を確認してください。');
+  }
+  if (status === 401 || status === 403) {
+    return aiFailure_('AI_AUTH_ERROR', 'APIキーが正しくないか、権限がありません。GEMINI_API_KEY を確認してください。');
+  }
+  if (status === 404) {
+    return aiFailure_('AI_MODEL_NOT_FOUND', 'モデルを利用できませんでした。GEMINI_MODEL の設定を確認してください。');
+  }
+  if (status === 429) {
+    return aiFailure_('AI_RATE_LIMITED', 'AIの利用上限に達しました。少し時間をおいてからお試しください。');
+  }
+  if (status < 200 || status >= 300) {
+    return aiFailure_('AI_HTTP_ERROR', 'AIサービスがエラーを返しました（HTTP ' + status + '）。');
+  }
+
+  let data;
+  try {
+    data = JSON.parse(response.getContentText());
+  } catch (e) {
+    return aiFailure_('AI_BAD_RESPONSE', 'AIの応答を読み取れませんでした。');
+  }
+
+  const feedback = data.promptFeedback || {};
+  if (feedback.blockReason) {
+    return aiFailure_('AI_BLOCKED', 'AI側の安全フィルタにより、この問題の補助解説は作れませんでした。');
+  }
+
+  const candidates = data.candidates || [];
+  const content = candidates.length ? (candidates[0].content || {}) : {};
+  const text = (content.parts || []).map(p => String(p.text || '')).join('').trim();
+  if (!text) {
+    return aiFailure_('AI_EMPTY_RESPONSE', 'AIから補助解説が返りませんでした。もう一度お試しください。');
+  }
+
+  return { ok: true, text: text };
+}
+
+function aiCacheGet_(key) {
+  try {
+    const raw = CacheService.getUserCache().get(key);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+function aiCachePut_(key, value) {
+  try {
+    const raw = JSON.stringify(value);
+    if (raw.length > AI_CONFIG.MAX_CACHE_CHARS) return;
+    CacheService.getUserCache().put(key, raw, AI_CONFIG.CACHE_SECONDS);
+  } catch (e) {
+    // キャッシュできなくても本体の動作は変えない。
+  }
+}
+
+function aiPick_(obj, names) {
+  for (let i = 0; i < names.length; i++) {
+    const v = obj[names[i]];
+    if (v !== undefined && v !== null && String(v) !== '') return v;
+  }
+  return '';
+}
+
+function aiFailure_(code, message) {
+  return { ok: false, error_code: String(code), message: String(message) };
 }
 
 /* ----------------------------- internal helpers ----------------------------- */
