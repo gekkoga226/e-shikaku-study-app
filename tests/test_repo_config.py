@@ -5,7 +5,9 @@
   - appsscript.json の設定を壊さない
       timeZone / runtimeVersion / exceptionLogging を維持する
       webapp は access=MYSELF, executeAs=USER_DEPLOYING
-      oauthScopes は spreadsheets と drive.readonly だけ（権限を広げない）
+      oauthScopes は spreadsheets / drive.readonly / script.external_request の
+      3つだけ（script.external_request はGemini APIの呼び出しに必要。
+      これ以外の権限追加は失敗させる）
   - 対象スプレッドシートIDを変えない
   - 認証情報ファイルをGitで管理しない
   - CI / デプロイのワークフローが存在し、検査に合格してからデプロイする
@@ -25,9 +27,21 @@ from gas_source import SRC, read  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 SPREADSHEET_ID = '1hAsu5eR3dtHu6S34joxyCaNmLZBtSnivIguVqJ61bh8'
 
+# ここに書いていない権限を appsscript.json へ足すと CI が落ちる。
 ALLOWED_SCOPES = {
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive.readonly',
+    # AI補助解説（Gemini API）をサーバー側から呼ぶためだけに必要。
+    'https://www.googleapis.com/auth/script.external_request',
+}
+
+# 「Drive全権限」など、広げてはいけない権限の代表例。
+FORBIDDEN_SCOPES = {
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/drive.file',
+    'https://www.googleapis.com/auth/gmail.send',
+    'https://mail.google.com/',
+    'https://www.googleapis.com/auth/userinfo.email',
 }
 
 
@@ -56,6 +70,20 @@ class TestAppsScriptManifest(unittest.TestCase):
             scopes, ALLOWED_SCOPES,
             f'必要以上の権限が要求されています: {sorted(scopes - ALLOWED_SCOPES)}',
         )
+
+    def test_oauth_scopes_are_exactly_three(self):
+        """AI補助解説の追加で増やしてよい権限は script.external_request の1つだけ。"""
+        scopes = self.manifest['oauthScopes']
+        self.assertEqual(len(scopes), 3, f'権限の数が3つではありません: {scopes}')
+        self.assertEqual(len(set(scopes)), 3, '権限が重複しています')
+        self.assertIn('https://www.googleapis.com/auth/script.external_request', scopes,
+                      'Gemini API 呼び出し用の script.external_request がありません')
+
+    def test_no_broad_scopes(self):
+        """Drive全権限など、広すぎる権限を足していないこと。"""
+        scopes = set(self.manifest['oauthScopes'])
+        offenders = sorted(scopes & FORBIDDEN_SCOPES)
+        self.assertEqual(offenders, [], f'広すぎる権限が要求されています: {offenders}')
 
 
 class TestSpreadsheetTarget(unittest.TestCase):

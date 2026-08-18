@@ -8,7 +8,9 @@
     startedAt: 0,
     excludeQuestionIds: [],
     presentSeq: 0,
-    failedQuestions: new Set()
+    failedQuestions: new Set(),
+    attemptId: '',
+    aiSeq: 0
   };
 
   const $ = id => document.getElementById(id);
@@ -20,6 +22,7 @@
     $('resultHomeBtn').addEventListener('click', showHome);
     $('nextBtn').addEventListener('click', loadNextQuestion);
     $('submitBtn').addEventListener('click', submitCurrentAnswer);
+    $('aiExplainBtn').addEventListener('click', requestAiExplanation);
     $('lightboxClose').addEventListener('click', closeLightbox);
     $('lightbox').addEventListener('click', e => { if (e.target === $('lightbox')) closeLightbox(); });
     document.addEventListener('change', updateSubmitState);
@@ -114,6 +117,8 @@
     const seq = ++state.presentSeq;
     state.current = null;
     state.selectedAnswer = '';
+    state.attemptId = '';
+    resetAiExplanation();
     setQuestionLoading('問題を選んでいます。');
 
     google.script.run
@@ -342,6 +347,10 @@
   }
 
   function renderResult(r) {
+    // AI補助解説は、この attempt_id が実在する回答にだけ紐づく。
+    state.attemptId = String(r.attempt_id || '');
+    resetAiExplanation();
+
     $('questionLoading').classList.add('hidden');
     $('questionCard').classList.add('hidden');
     $('resultCard').classList.remove('hidden');
@@ -370,6 +379,65 @@
 
     // 次の問題の選択時は、回答した直後の同じ問題を避ける。
     state.current = null;
+  }
+
+  function resetAiExplanation() {
+    state.aiSeq += 1;
+
+    const box = $('aiExplanationBox');
+    box.textContent = '';
+    box.classList.add('hidden');
+
+    const status = $('aiStatus');
+    status.textContent = '';
+    status.classList.add('hidden');
+
+    const btn = $('aiExplainBtn');
+    btn.textContent = 'AIでさらに噛み砕く';
+    btn.disabled = !state.attemptId;
+  }
+
+  // AIはこのボタンを押したときだけ呼ぶ（毎問自動では呼ばない）。
+  function requestAiExplanation() {
+    if (!state.attemptId) {
+      showToast('回答が記録された問題にだけAI解説を出せます。');
+      return;
+    }
+
+    const seq = ++state.aiSeq;
+    const btn = $('aiExplainBtn');
+    const status = $('aiStatus');
+    btn.disabled = true;
+    status.textContent = 'AIが補助解説を作っています。少しお待ちください。';
+    status.classList.remove('hidden');
+
+    google.script.run
+      .withSuccessHandler(res => {
+        if (seq !== state.aiSeq) return;
+        btn.disabled = false;
+
+        if (!res || !res.ok) {
+          status.textContent = (res && res.message)
+            ? res.message
+            : 'AI補助解説を取得できませんでした。採点と理解度の記録は正常です。';
+          return;
+        }
+
+        status.textContent = 'モデル: ' + (res.model || '') +
+          (res.cached ? '（1時間以内に作成済みの結果を再表示）' : '');
+        const box = $('aiExplanationBox');
+        box.textContent = res.text || '';
+        box.classList.remove('hidden');
+        btn.textContent = 'AI解説をもう一度作る';
+      })
+      .withFailureHandler(err => {
+        if (seq !== state.aiSeq) return;
+        btn.disabled = false;
+        status.textContent = (err && err.message)
+          ? err.message
+          : 'AI補助解説を取得できませんでした。採点と理解度の記録は正常です。';
+      })
+      .getAiExplanation({ attemptId: state.attemptId });
   }
 
   function rememberExcluded(qid) {
