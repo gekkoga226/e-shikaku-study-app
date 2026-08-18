@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: リポジトリを取得する
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 検査を実行する
         uses: ./.github/actions/verify

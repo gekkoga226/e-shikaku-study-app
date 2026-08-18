@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: リポジトリを取得する
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 検査を実行する
         uses: ./.github/actions/verify
@@ -45,10 +45,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: リポジトリを取得する
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Node.js 20 を用意する
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '20'
           cache: npm
