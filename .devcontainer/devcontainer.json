@@ -1,0 +1,21 @@
+{
+  "name": "E資格 学習Webアプリ (clasp / Node 20)",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:1-20-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.11"
+    }
+  },
+  "postCreateCommand": "npm ci --no-audit --no-fund",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint"
+      ]
+    }
+  },
+  "remoteEnv": {
+    "clasp_config_auth": "${containerEnv:HOME}/.clasprc.json"
+  }
+}

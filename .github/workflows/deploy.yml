@@ -1,0 +1,123 @@
+name: Deploy to Google Apps Script
+
+# main ブランチが更新されたら、Apps Script へ自動反映する。
+#   1. 検査（CIと同じ内容）
+#   2. clasp push
+#   3. 版（version）を作成
+#   4. 既存のWebアプリ deployment を新しい版へ更新
+#
+# 検査に失敗した場合、デプロイジョブは動かない。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - '.claspignore'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'scripts/deploy.sh'
+      - '.github/workflows/deploy.yml'
+      - '.github/actions/verify/action.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同時に2つデプロイが走らないようにする。
+concurrency:
+  group: deploy-apps-script
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: コード検査
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリを取得する
+        uses: actions/checkout@v4
+
+      - name: 検査を実行する
+        uses: ./.github/actions/verify
+
+  deploy:
+    name: Apps Script へ反映する
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリを取得する
+        uses: actions/checkout@v4
+
+      - name: Node.js 20 を用意する
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: 依存パッケージをインストールする
+        run: npm ci --no-audit --no-fund
+
+      - name: 必要なSecretsがあるか確認する
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+          CLASP_JSON: ${{ secrets.CLASP_JSON }}
+        run: |
+          missing=0
+          # 値そのものは絶対に表示しない。有無だけを見る。
+          [ -n "$CLASPRC_JSON" ] || { echo "::error::CLASPRC_JSON が未登録です。scripts/bootstrap-smartphone.sh を実行してください。"; missing=1; }
+          [ -n "$CLASP_JSON" ]   || { echo "::error::CLASP_JSON が未登録です。scripts/bootstrap-smartphone.sh を実行してください。"; missing=1; }
+          [ "$missing" -eq 0 ] || exit 1
+          echo "必要なSecretsは登録されています。"
+
+      - name: 認証情報と接続先を復元する
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+          CLASP_JSON: ${{ secrets.CLASP_JSON }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          # Googleのログイン情報（ランナーが消えれば一緒に消える）
+          printf '%s' "$CLASPRC_JSON" > "$HOME/.clasprc.json"
+
+          # 接続先の Apps Script プロジェクト。
+          # rootDir は必ず src に固定する（誤った値で全ファイルを送らないため）。
+          printf '%s' "$CLASP_JSON" > .clasp.json.raw
+          node -e '
+            const fs = require("fs");
+            const raw = fs.readFileSync(".clasp.json.raw", "utf8");
+            let cfg;
+            try { cfg = JSON.parse(raw); }
+            catch (e) { console.error("::error::CLASP_JSON が正しいJSONではありません。"); process.exit(1); }
+            if (!cfg.scriptId) { console.error("::error::CLASP_JSON に scriptId がありません。"); process.exit(1); }
+            fs.writeFileSync(".clasp.json", JSON.stringify({ scriptId: cfg.scriptId, rootDir: "src" }, null, 2) + "\n");
+          '
+          rm -f .clasp.json.raw
+
+          # 復元できたかどうかだけ確認する（中身は出さない）。
+          test -s "$HOME/.clasprc.json" && echo "ログイン情報を復元しました。"
+          test -s .clasp.json && echo "接続先を復元しました。"
+
+      - name: push / version / deployment更新
+        env:
+          # clasp は既定で $HOME/.clasprc.json を読む。上の手順でそこへ復元済み。
+          DEPLOYMENT_ID: ${{ secrets.DEPLOYMENT_ID }}
+          DEPLOY_DESCRIPTION: "main ${{ github.sha }}"
+        run: bash scripts/deploy.sh
+
+      - name: 認証情報の後片付け
+        if: always()
+        run: |
+          rm -f "$HOME/.clasprc.json" .clasp.json .clasp.json.raw || true
+          echo "一時的な認証情報を削除しました。"
+
+      - name: デプロイ結果まとめ
+        if: always()
+        run: |
+          {
+            echo "## デプロイ結果"
+            echo ""
+            echo "- コミット: \`${{ github.sha }}\`"
+            echo "- 結果: \`${{ job.status }}\`"
+            echo ""
+            echo "WebアプリURLは変わりません。スマホのホーム画面のアイコンはそのまま使えます。"
+          } >> "$GITHUB_STEP_SUMMARY"

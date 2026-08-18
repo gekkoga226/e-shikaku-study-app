@@ -1,0 +1,406 @@
+<script>
+(() => {
+  const state = {
+    mode: 'learning',
+    current: null,
+    selectedAnswer: '',
+    sessionId: 'WEB-' + new Date().toISOString().replace(/\D/g, '').slice(0, 14) + '-' + Math.random().toString(36).slice(2, 8),
+    startedAt: 0,
+    excludeQuestionIds: [],
+    presentSeq: 0,
+    failedQuestions: new Set()
+  };
+
+  const $ = id => document.getElementById(id);
+
+  document.addEventListener('DOMContentLoaded', () => {
+    $('startBtn').addEventListener('click', () => startLearning('learning'));
+    $('reviewBtn').addEventListener('click', () => startLearning('review'));
+    $('homeBtn').addEventListener('click', showHome);
+    $('resultHomeBtn').addEventListener('click', showHome);
+    $('nextBtn').addEventListener('click', loadNextQuestion);
+    $('submitBtn').addEventListener('click', submitCurrentAnswer);
+    $('lightboxClose').addEventListener('click', closeLightbox);
+    $('lightbox').addEventListener('click', e => { if (e.target === $('lightbox')) closeLightbox(); });
+    document.addEventListener('change', updateSubmitState);
+    loadHomeData();
+  });
+
+  function loadHomeData() {
+    google.script.run
+      .withSuccessHandler(data => {
+        $('ruleLabel').textContent = data.ruleVersion
+          ? '理解度基準: ' + data.ruleVersion
+          : '理解度基準をシートから読み込み';
+        renderDashboard(data.dashboard || []);
+        renderWeaknesses(data.weaknesses || []);
+      })
+      .withFailureHandler(showServerError)
+      .getInitialData();
+  }
+
+  function renderDashboard(items) {
+    const grid = $('dashboardGrid');
+    grid.innerHTML = '';
+    const wanted = new Set(['論点着手率', '平均理解度', '問題消化率', '未回答verified問題数']);
+    items.filter(x => wanted.has(x.label)).forEach(x => {
+      const div = document.createElement('div');
+      div.className = 'metric';
+      const label = document.createElement('div');
+      label.className = 'metric-label';
+      label.textContent = x.label;
+      const value = document.createElement('div');
+      value.className = 'metric-value';
+      value.textContent = x.value;
+      div.append(label, value);
+      grid.appendChild(div);
+    });
+  }
+
+  function renderWeaknesses(items) {
+    const list = $('weaknessList');
+    list.innerHTML = '';
+    items.forEach(x => {
+      const row = document.createElement('div');
+      row.className = 'weakness-item';
+
+      const name = document.createElement('div');
+      name.className = 'weakness-name';
+      name.textContent = x.topic || x.node_id;
+
+      const pct = document.createElement('div');
+      pct.textContent = String(x.mastery_pct) + '%';
+
+      const track = document.createElement('div');
+      track.className = 'progress-track';
+      const bar = document.createElement('div');
+      bar.className = 'progress-bar';
+      bar.style.width = Math.max(0, Math.min(100, Number(x.mastery_pct || 0))) + '%';
+      track.appendChild(bar);
+
+      row.append(name, pct, track);
+      list.appendChild(row);
+    });
+  }
+
+  function startLearning(mode) {
+    state.mode = mode === 'review' ? 'review' : 'learning';
+    state.excludeQuestionIds = [];
+    state.failedQuestions.clear();
+    showQuestionView();
+    loadNextQuestion();
+  }
+
+  function showHome() {
+    state.current = null;
+    $('questionView').classList.add('hidden');
+    $('homeView').classList.remove('hidden');
+    loadHomeData();
+  }
+
+  function showQuestionView() {
+    $('homeView').classList.add('hidden');
+    $('questionView').classList.remove('hidden');
+  }
+
+  function setQuestionLoading(message) {
+    $('questionCard').classList.add('hidden');
+    $('resultCard').classList.add('hidden');
+    $('questionLoading').classList.remove('hidden');
+    $('loadingMessage').textContent = message || '安全に表示できるか確認中です。';
+  }
+
+  function loadNextQuestion() {
+    const seq = ++state.presentSeq;
+    state.current = null;
+    state.selectedAnswer = '';
+    setQuestionLoading('問題を選んでいます。');
+
+    google.script.run
+      .withSuccessHandler(q => {
+        if (seq !== state.presentSeq) return;
+        if (!q || !q.ok) {
+          setQuestionLoading('現在の条件で出せる問題がありません。');
+          showToast('出題できる問題が見つかりませんでした。');
+          return;
+        }
+        presentQuestion(q, seq);
+      })
+      .withFailureHandler(err => {
+        if (seq !== state.presentSeq) return;
+        showServerError(err);
+      })
+      .getNextQuestion({
+        mode: state.mode,
+        excludeQuestionIds: state.excludeQuestionIds
+      });
+  }
+
+  function presentQuestion(q, seq) {
+    if (!q.image_required) {
+      renderQuestion(q, { question_images: [], option_images: {} }, seq);
+      return;
+    }
+
+    // 重要: 画像問題は、この時点では問題文も選択肢も画面へ出さない。
+    setQuestionLoading('画像を取得し、実際に表示できるか確認しています。');
+
+    google.script.run
+      .withSuccessHandler(bundle => {
+        if (seq !== state.presentSeq) return;
+        if (!bundle || !bundle.ok) {
+          rejectImageQuestion(q, 'SERVER_IMAGE_BUNDLE_FAILED');
+          return;
+        }
+        preloadBundle(bundle)
+          .then(() => {
+            if (seq !== state.presentSeq) return;
+            renderQuestion(q, bundle, seq);
+          })
+          .catch(() => rejectImageQuestion(q, 'BROWSER_IMAGE_PRELOAD_FAILED'));
+      })
+      .withFailureHandler(() => {
+        if (seq !== state.presentSeq) return;
+        rejectImageQuestion(q, 'SERVER_CALL_FAILED');
+      })
+      .getQuestionImageBundle(q.question_id);
+  }
+
+  function preloadBundle(bundle) {
+    const urls = [];
+    (bundle.question_images || []).forEach(x => urls.push(x.data_url));
+    Object.keys(bundle.option_images || {}).forEach(letter => {
+      (bundle.option_images[letter] || []).forEach(x => urls.push(x.data_url));
+    });
+
+    return Promise.all(urls.map(src => new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        if (img.naturalWidth > 0 && img.naturalHeight > 0) resolve();
+        else reject(new Error('zero size image'));
+      };
+      img.onerror = reject;
+      img.src = src;
+    })));
+  }
+
+  function rejectImageQuestion(q, reason) {
+    if (!q || !q.question_id) return;
+    if (state.failedQuestions.has(q.question_id)) return;
+    state.failedQuestions.add(q.question_id);
+    rememberExcluded(q.question_id);
+
+    // 回答ボタンを出さず、別問題へ移動する。
+    setQuestionLoading('画像を確認できなかったため、この問題はスキップしました。');
+    google.script.run.reportImageLoadFailure(q.question_id, reason);
+    window.setTimeout(loadNextQuestion, 350);
+  }
+
+  function renderQuestion(q, bundle, seq) {
+    if (seq !== state.presentSeq) return;
+
+    state.current = q;
+    state.selectedAnswer = '';
+    state.startedAt = Date.now();
+
+    $('questionLoading').classList.add('hidden');
+    $('resultCard').classList.add('hidden');
+    $('questionCard').classList.remove('hidden');
+
+    $('topicBadge').textContent = q.topic || q.primary_node_id || '論点';
+    $('masteryBadge').textContent = '理解度 ' + String(q.mastery_pct || 0) + '%';
+    $('questionText').textContent = q.question_text || '';
+
+    renderQuestionImages(q, bundle.question_images || []);
+    renderOptions(q, bundle.option_images || []);
+
+    document.querySelectorAll('input[name="confidence"]').forEach(x => { x.checked = false; });
+    $('submitBtn').disabled = true;
+  }
+
+  function renderQuestionImages(q, images) {
+    const area = $('questionImages');
+    area.innerHTML = '';
+    images.forEach((x, idx) => {
+      const img = document.createElement('img');
+      img.className = 'question-image';
+      img.alt = '問題画像 ' + (idx + 1);
+      img.src = x.data_url;
+      img.addEventListener('click', () => openLightbox(x.data_url));
+      img.addEventListener('error', () => rejectRenderedImage(q, 'QUESTION_IMAGE_RENDER_ERROR'));
+      area.appendChild(img);
+    });
+  }
+
+  function renderOptions(q, optionImages) {
+    const area = $('optionsArea');
+    area.innerHTML = '';
+
+    Object.keys(q.options || {}).sort().forEach(letter => {
+      const row = document.createElement('div');
+      row.className = 'option-row';
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'answer-btn';
+      button.dataset.option = letter;
+
+      const badge = document.createElement('span');
+      badge.className = 'answer-letter';
+      badge.textContent = letter;
+
+      const body = document.createElement('span');
+      body.className = 'option-body';
+
+      const text = document.createElement('span');
+      text.className = 'option-text';
+      text.textContent = q.options[letter] || '';
+      body.appendChild(text);
+
+      const imgs = optionImages[letter] || [];
+      imgs.forEach((x, idx) => {
+        const img = document.createElement('img');
+        img.className = 'option-image';
+        img.alt = '選択肢 ' + letter + ' の画像 ' + (idx + 1);
+        img.src = x.data_url;
+        img.addEventListener('error', () => rejectRenderedImage(q, 'OPTION_IMAGE_RENDER_ERROR:' + letter));
+        body.appendChild(img);
+      });
+
+      button.append(badge, body);
+      button.addEventListener('click', () => selectAnswer(letter));
+      row.appendChild(button);
+
+      if (imgs.length) {
+        const zoom = document.createElement('button');
+        zoom.type = 'button';
+        zoom.className = 'zoom-btn';
+        zoom.textContent = '拡大';
+        zoom.setAttribute('aria-label', '選択肢 ' + letter + ' の画像を拡大');
+        zoom.addEventListener('click', () => openLightbox(imgs[0].data_url));
+        row.appendChild(zoom);
+      }
+
+      area.appendChild(row);
+    });
+  }
+
+  function rejectRenderedImage(q, reason) {
+    // DOM挿入後の読み込み失敗も「画像なしで回答させない」。
+    $('submitBtn').disabled = true;
+    rejectImageQuestion(q, reason);
+  }
+
+  function selectAnswer(letter) {
+    state.selectedAnswer = letter;
+    document.querySelectorAll('.answer-btn').forEach(btn => {
+      btn.classList.toggle('selected', btn.dataset.option === letter);
+    });
+    updateSubmitState();
+  }
+
+  function updateSubmitState() {
+    if (!state.current) {
+      $('submitBtn').disabled = true;
+      return;
+    }
+    const conf = getConfidence();
+    $('submitBtn').disabled = !(state.selectedAnswer && conf);
+  }
+
+  function getConfidence() {
+    const checked = document.querySelector('input[name="confidence"]:checked');
+    return checked ? Number(checked.value) : 0;
+  }
+
+  function submitCurrentAnswer() {
+    if (!state.current || !state.selectedAnswer || !getConfidence()) return;
+
+    const q = state.current;
+    const responseSeconds = Math.max(0, Math.round((Date.now() - state.startedAt) / 1000));
+    $('submitBtn').disabled = true;
+    setQuestionLoading('回答を記録し、新しい理解度を再計算しています。');
+
+    google.script.run
+      .withSuccessHandler(result => {
+        if (!result || !result.ok) {
+          showToast('回答を記録できませんでした。');
+          return;
+        }
+        rememberExcluded(q.question_id);
+        renderResult(result);
+      })
+      .withFailureHandler(showServerError)
+      .submitAnswer({
+        questionId: q.question_id,
+        userAnswer: state.selectedAnswer,
+        confidence: getConfidence(),
+        responseSeconds,
+        mode: state.mode,
+        sessionId: state.sessionId
+      });
+  }
+
+  function renderResult(r) {
+    $('questionLoading').classList.add('hidden');
+    $('questionCard').classList.add('hidden');
+    $('resultCard').classList.remove('hidden');
+
+    const good = !!r.is_correct;
+    $('resultMark').textContent = good ? '○' : '×';
+    $('resultMark').className = 'result-mark ' + (good ? 'good' : 'bad');
+    $('resultTitle').textContent = good ? '正解です' : '不正解です';
+    $('resultTitle').className = good ? 'good' : 'bad';
+
+    $('answerSummary').textContent =
+      'あなたの回答: ' + r.user_answer + ' ／ 正解: ' + r.correct_answer;
+
+    $('masteryChange').textContent =
+      '理解度: ' + r.mastery_before + '% → ' + r.mastery_after + '%' +
+      (r.next_review_at ? '　次回復習: ' + r.next_review_at : '');
+
+    const parts = [];
+    if (r.explanation_plain) parts.push(r.explanation_plain);
+    if (r.explanation_formal) parts.push(r.explanation_formal);
+    if (r.explanation_calculation) parts.push(r.explanation_calculation);
+    if (r.explanation_options) parts.push(r.explanation_options);
+    $('explanationBox').textContent = parts.length
+      ? parts.join('\n\n')
+      : '解説データは未登録です。正誤と理解度は正常に記録されています。';
+
+    // 次の問題の選択時は、回答した直後の同じ問題を避ける。
+    state.current = null;
+  }
+
+  function rememberExcluded(qid) {
+    if (!qid) return;
+    state.excludeQuestionIds.push(qid);
+    if (state.excludeQuestionIds.length > 30) {
+      state.excludeQuestionIds = state.excludeQuestionIds.slice(-30);
+    }
+  }
+
+  function openLightbox(src) {
+    $('lightboxImage').src = src;
+    $('lightbox').classList.remove('hidden');
+  }
+
+  function closeLightbox() {
+    $('lightbox').classList.add('hidden');
+    $('lightboxImage').removeAttribute('src');
+  }
+
+  function showToast(message) {
+    const toast = $('toast');
+    toast.textContent = message;
+    toast.classList.remove('hidden');
+    window.setTimeout(() => toast.classList.add('hidden'), 2600);
+  }
+
+  function showServerError(err) {
+    const msg = err && err.message ? err.message : String(err || '不明なエラー');
+    setQuestionLoading('処理中にエラーが発生しました。');
+    showToast(msg);
+  }
+})();
+</script>

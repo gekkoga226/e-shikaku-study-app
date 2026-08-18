@@ -1,0 +1,43 @@
+name: CI
+
+# Pull Request と、main以外のブランチへのpushで自動実行する。
+# ここが赤い（失敗している）コードは main へ入れない。
+on:
+  pull_request:
+    branches: ['**']
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: コード検査
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリを取得する
+        uses: actions/checkout@v4
+
+      - name: 検査を実行する
+        uses: ./.github/actions/verify
+
+      - name: 検査結果まとめ
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## 検査結果"
+            echo ""
+            echo "- 必須ファイル確認"
+            echo "- 構文検査（.gs / HTML内JavaScript / appsscript.json）"
+            echo "- 機密情報混入チェック"
+            echo "- Pythonテスト（理解度v2 / 画像必須 / 正解漏洩防止の守り）"
+            echo ""
+            echo "結果: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
