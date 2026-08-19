@@ -11,7 +11,10 @@
     failedQuestions: new Set(),
     attemptId: '',
     aiSeq: 0,
-    lightboxZoomed: false
+    lightboxZoomed: false,
+    // 結果を読んでいるあいだに用意しておく次の1問（読み取りだけ・書き込みはしない）
+    prefetch: null,
+    prefetchKey: ''
   };
 
   const $ = id => document.getElementById(id);
@@ -132,11 +135,13 @@
     state.mode = MODES.indexOf(mode) >= 0 ? mode : 'learning';
     state.excludeQuestionIds = [];
     state.failedQuestions.clear();
+    clearPrefetch();
     showQuestionView();
     loadNextQuestion();
   }
 
   function showHome() {
+    clearPrefetch();
     state.current = null;
     $('questionView').classList.add('hidden');
     $('homeView').classList.remove('hidden');
@@ -173,6 +178,16 @@
     state.selectedAnswer = '';
     state.attemptId = '';
     resetAiExplanation();
+
+    // 解説を読んでいるあいだに用意できていれば、待たずにそのまま表示する。
+    // 画像問題は先読みの段階で preloadBundle を通っているので、
+    // 「画像の読み込み成功を確認してから表示する」順序は変わらない。
+    const ready = takePrefetchedQuestion();
+    if (ready) {
+      renderQuestion(ready.question, ready.bundle, seq);
+      return;
+    }
+
     setQuestionLoading('問題を選んでいます。');
 
     google.script.run
@@ -479,6 +494,78 @@
 
     // 次の問題の選択時は、回答した直後の同じ問題を避ける。
     state.current = null;
+
+    // 解説を読んでいるあいだに、次の1問を裏で用意しておく。
+    prefetchNextQuestion();
+  }
+
+  /* ------------------------- 次の問題の先読み -------------------------
+   *
+   * 目的は待ち時間を隠すことだけで、採点・理解度・学習ログには一切関わらない。
+   * 呼ぶのは読み取り専用の getNextQuestion / getQuestionImageBundle だけ。
+   *
+   * 用意したものは「そのときの条件（モードと除外リスト）」に紐づけて持つ。
+   * 条件が変わっていたら使わずに捨て、ふつうに取り直す。
+   * 画像問題は先読みの時点で preloadBundle を通し、
+   * 成功したものだけを手元に残す（表示できない画像の問題を先読みで出さない）。
+   */
+  function prefetchKey() {
+    return state.mode + '|' + state.excludeQuestionIds.join(',');
+  }
+
+  function clearPrefetch() {
+    state.prefetch = null;
+    state.prefetchKey = '';
+  }
+
+  function takePrefetchedQuestion() {
+    const ready = state.prefetch;
+    if (!ready) return null;
+    clearPrefetch();
+    if (ready.key !== prefetchKey()) return null;
+    if (state.failedQuestions.has(String(ready.question.question_id))) return null;
+    return ready;
+  }
+
+  function prefetchNextQuestion() {
+    const key = prefetchKey();
+    if (state.prefetchKey === key) return;
+
+    state.prefetch = null;
+    state.prefetchKey = key;
+
+    // 先読みが失敗しても画面には出さない。次に押されたとき通常どおり取りに行く。
+    const giveUp = () => { if (state.prefetchKey === key) clearPrefetch(); };
+    const keep = (question, bundle) => {
+      if (state.prefetchKey !== key) return;
+      state.prefetch = { key: key, question: question, bundle: bundle };
+    };
+
+    google.script.run
+      .withSuccessHandler(q => {
+        if (state.prefetchKey !== key) return;
+        if (!q || !q.ok) { giveUp(); return; }
+        if (!q.image_required) {
+          keep(q, { question_images: [], option_images: {} });
+          return;
+        }
+
+        google.script.run
+          .withSuccessHandler(bundle => {
+            if (state.prefetchKey !== key) return;
+            if (!bundle || !bundle.ok) { giveUp(); return; }
+            preloadBundle(bundle)
+              .then(() => keep(q, bundle))
+              .catch(giveUp);
+          })
+          .withFailureHandler(giveUp)
+          .getQuestionImageBundle(q.question_id);
+      })
+      .withFailureHandler(giveUp)
+      .getNextQuestion({
+        mode: state.mode,
+        excludeQuestionIds: state.excludeQuestionIds.slice()
+      });
   }
 
   /**

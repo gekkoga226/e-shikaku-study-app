@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from gas_source import function_source  # noqa: E402
+from gas_source import function_source, read  # noqa: E402
 
 NODE = shutil.which('node')
 
@@ -32,6 +32,16 @@ def require_node(testcase: unittest.TestCase) -> None:
 def collect(source: str, names) -> str:
     """指定した関数の宣言をそのまま連結する。"""
     return '\n\n'.join(function_source(source, name) for name in names)
+
+
+def gas_bundle(names=('ImageManifest.gs', 'ImageSupport.gs', 'Code.gs')) -> str:
+    """Apps Script のソースを丸ごと連結する。
+
+    関数を1つずつ切り出す collect() と違い、実際のファイルをそのまま動かす。
+    「呼び出しの順序」「往復の回数」のように、関数どうしのつながりまで
+    含めて確かめたいときに使う。Google側のAPIは呼び出し側で差し替える。
+    """
+    return '\n;\n'.join(read(name) for name in names)
 
 
 def run(script: str):

@@ -110,9 +110,18 @@ function getNextQuestion(request) {
     return nextUnansweredQuestion_(formal, logs, excludes);
   }
 
-  const questions = formal
-    .filter(q => !excludes.has(String(q.question_id)))
-    .filter(q => imageSupportAllowsQuestionObject_(q));
+  /*
+   * 画像を用意できるかどうかの点検（imageSupportAllowsQuestionObject_）は、
+   * 1問につきキャッシュ参照2回とSHA-256計算1回を伴う。
+   * ここで候補全部にかけると、画像問題148問ぶん＝約450回の呼び出しになり、
+   * 1問出すたびに数百回の往復が発生していた。
+   *
+   * 点検の中身も、並べる基準も変えない。優先順位で並べたあと、
+   * 上から順に必要なぶんだけ点検する（＝ふつうは1問ぶんで済む）。
+   * 並び順は question_id まで含めた全順序なので、
+   * 「先に絞ってから最小を取る」のと「並べてから最初の合格を取る」のは同じ結果になる。
+   */
+  const questions = formal.filter(q => !excludes.has(String(q.question_id)));
 
   if (!questions.length) {
     return { ok: false, reason: 'NO_ELIGIBLE_QUESTION' };
@@ -168,16 +177,25 @@ function getNextQuestion(request) {
       return String(a.q.question_id).localeCompare(String(b.q.question_id));
     });
 
-    if (scored.length) {
-      return publicQuestion_(scored[0].q, node, mode);
+    for (const item of scored) {
+      if (imageSupportAllowsQuestionObject_(item.q)) {
+        return publicQuestion_(item.q, node, mode);
+      }
     }
   }
 
   // 想定外にprimaryで選べない場合の安全なフォールバック。
   // masteryへ直接加点するためではなく、正式問題を出題できる状態を保つため。
-  const fallback = questions.sort((a, b) => String(a.question_id).localeCompare(String(b.question_id)))[0];
-  const node = nodes.find(n => n.node_id === String(fallback.primary_node_id || '')) || null;
-  return publicQuestion_(fallback, node, mode);
+  const fallback = questions.slice()
+    .sort((a, b) => String(a.question_id).localeCompare(String(b.question_id)));
+  for (const q of fallback) {
+    if (!imageSupportAllowsQuestionObject_(q)) continue;
+    const node = nodes.find(n => n.node_id === String(q.primary_node_id || '')) || null;
+    return publicQuestion_(q, node, mode);
+  }
+
+  // 画像を用意できる問題が1問も無い状態。回答させないほうが安全なので出題しない。
+  return { ok: false, reason: 'NO_ELIGIBLE_QUESTION' };
 }
 
 /* --------------------------- 未回答問題優先モード ---------------------------
@@ -211,11 +229,24 @@ function nextUnansweredQuestion_(formalQuestions, logs, excludes) {
     };
   }
 
-  const candidates = unanswered
-    .filter(q => !excludes.has(String(q.question_id)))
-    .filter(q => imageSupportAllowsQuestionObject_(q));
+  const candidates = unanswered.filter(q => !excludes.has(String(q.question_id)));
 
-  if (!candidates.length) {
+  const nodeById = {};
+  readMindmapLeafNodes_().forEach(node => { nodeById[node.node_id] = node; });
+
+  // 画像を用意できるかの点検は、優先順位で並べたあと上から順に、
+  // 必要なぶんだけ行う（getNextQuestion と同じ考え方）。
+  // 点検の中身も優先順位も変えないので、選ばれる問題は従来と同じ。
+  const ordered = candidates.slice().sort((a, b) => compareUnansweredCandidates_(a, b, nodeById));
+  let picked = null;
+  for (const candidate of ordered) {
+    if (imageSupportAllowsQuestionObject_(candidate)) {
+      picked = candidate;
+      break;
+    }
+  }
+
+  if (!picked) {
     // 未回答は残っているが、いまは表示できない（画像取得に失敗した直後など）。
     // ここでも回答済み問題へは戻らない。
     return {
@@ -227,10 +258,6 @@ function nextUnansweredQuestion_(formalQuestions, logs, excludes) {
     };
   }
 
-  const nodeById = {};
-  readMindmapLeafNodes_().forEach(node => { nodeById[node.node_id] = node; });
-
-  const picked = candidates.slice().sort((a, b) => compareUnansweredCandidates_(a, b, nodeById))[0];
   const node = nodeById[String(picked.primary_node_id || '')] || null;
 
   const payload = publicQuestion_(picked, node, 'unanswered');
@@ -363,7 +390,9 @@ function submitAnswer(payload) {
   if (!lock.tryLock(10000)) throw new Error('回答処理が重なっています。数秒後にもう一度お試しください。');
 
   try {
-    const ss = SpreadsheetApp.openById(APP_CONFIG.SPREADSHEET_ID);
+    // 読み取り経路と同じハンドルを使う。以前はここで別に開いていたため、
+    // 1回の回答でスプレッドシートを2回開いていた（notesのルール版取得で再度開かれる）。
+    const ss = spreadsheet_();
     const qSheet = ss.getSheetByName(APP_CONFIG.SHEETS.QUESTIONS);
     const logSheet = ss.getSheetByName(APP_CONFIG.SHEETS.LOG);
     const mapSheet = ss.getSheetByName(APP_CONFIG.SHEETS.MINDMAP);
@@ -382,7 +411,13 @@ function submitAnswer(payload) {
 
     const masteryBefore = numberOrZero_(mapSheet.getRange(nodeRow, 13).getValue()); // M
     const now = new Date();
-    const existingReview = mapSheet.getRange(nodeRow, 16).getValue(); // P
+
+    // 同じ行のE列(topic)とP列(next_review_at)は1回の読み取りでまとめて取る。
+    // 以前は復習日と論点名で別々に往復していた。
+    // M列(理解度)だけは確定手順どおり単独で読む（上の1行を動かさない）。
+    const nodeRowValues = mapSheet.getRange(nodeRow, 1, 1, 16).getValues()[0];
+    const nodeName = String(nodeRowValues[4] || ''); // E topic
+    const existingReview = nodeRowValues[15]; // P next_review_at
     const nextReview = computeNextReview_(isCorrect, existingReview, now);
 
     const targetRow = findLogicalNextLogRow_(logSheet);
@@ -437,12 +472,19 @@ function submitAnswer(payload) {
 
     // 最終回答日時と、明示されている誤答翌日復習ルールだけを更新。
     mapSheet.getRange(nodeRow, 15).setValue(now).setNumberFormat('yyyy-mm-dd hh:mm:ss'); // O
-    if (nextReview === '') {
-      mapSheet.getRange(nodeRow, 16).clearContent();
-    } else if (nextReview instanceof Date) {
-      mapSheet.getRange(nodeRow, 16).setValue(nextReview).setNumberFormat('yyyy/mm/dd');
-    } else {
-      mapSheet.getRange(nodeRow, 16).setValue(nextReview);
+
+    // P列は「変わるときだけ」書く。
+    // computeNextReview_ は期限が動かないとき既存の値をそのまま返すので、
+    // 以前は同じ値を毎回書き直していた（往復1〜2回ぶんの無駄）。
+    // 書かない＝現状のまま、なので結果は従来と同じ。
+    if (nextReview !== existingReview) {
+      if (nextReview instanceof Date) {
+        mapSheet.getRange(nodeRow, 16).setValue(nextReview).setNumberFormat('yyyy/mm/dd');
+      } else if (nextReview === '') {
+        mapSheet.getRange(nodeRow, 16).clearContent(); // 消化した期限を消す
+      } else {
+        mapSheet.getRange(nodeRow, 16).setValue(nextReview);
+      }
     }
 
     SpreadsheetApp.flush();
@@ -470,7 +512,7 @@ function submitAnswer(payload) {
       mastery_after: masteryAfter,
       next_review_at: formatMaybeDate_(nextReview),
       node_id: nodeId,
-      node_name: getNodeNameByRow_(mapSheet, nodeRow),
+      node_name: nodeName,
       counts_for_mastery: truthy_(uCell.getValue())
     };
   } finally {
@@ -684,7 +726,8 @@ function getAiExplanation(request) {
  * 見つからなければ、正解に関する情報を含めずに失敗を返す。
  */
 function readAnsweredAttempt_(attemptId) {
-  const ss = SpreadsheetApp.openById(APP_CONFIG.SPREADSHEET_ID);
+  // 読み取りだけなので共有ハンドルを使う（AI解説1回につき1度の接続で済む）。
+  const ss = spreadsheet_();
   const logSheet = ss.getSheetByName(APP_CONFIG.SHEETS.LOG);
   if (!logSheet) {
     return aiFailure_('LOG_SHEET_NOT_FOUND', '学習ログを読み取れませんでした。');
@@ -1324,8 +1367,18 @@ function findRowByValue_(sheet, col, value) {
   return 0;
 }
 
+/**
+ * 論理的な次の空き行（A列がまだ空の、いちばん上の行）を返す。
+ *
+ * 走査は「値のある最終行」までで打ち切る。getMaxRows() はU列の数式などで
+ * 実データよりずっと大きくなるため、以前はそのぶんだけ確実に空と分かっている
+ * 行まで読んでいた（実測で1回の回答あたり約1600セルの無駄読み）。
+ * getLastRow() より下の行にはA列の値が存在しないので、
+ * そこで見つからなければ次の行が空き行になる。見つかる行は従来と同じ。
+ */
 function findLogicalNextLogRow_(sheet) {
-  const max = sheet.getMaxRows();
+  const max = Math.min(sheet.getMaxRows(), Math.max(sheet.getLastRow(), 1));
+  if (max < 2) return 2;
   const values = sheet.getRange(2, 1, max - 1, 1).getValues();
   for (let i = 0; i < values.length; i++) {
     if (values[i][0] === '' || values[i][0] == null) return i + 2;
@@ -1350,14 +1403,56 @@ function ensureLogCapacity_(sheet, row) {
   sheet.insertRowsAfter(sheet.getMaxRows(), Math.max(100, row - sheet.getMaxRows()));
 }
 
+/*
+ * 00_設定の値は、回答のたびに読み直すほど頻繁には変わらない。
+ * mastery_rule_version は回答1件ごとにnotesへ書くために読んでいて、
+ * そのために毎回シートへ往復していた。数分だけ使い回す。
+ * 判定に使うのは表示用の文字列だけで、理解度の計算には使わない。
+ */
+const SETTING_CACHE_KEY_PREFIX = 'setting_v1:';
+const SETTING_CACHE_SECONDS = 300;
+
 function readSettingValue_(key) {
+  const cached = readSettingCache_(key);
+  if (cached !== null) return cached;
+
   const sh = spreadsheet_().getSheetByName(APP_CONFIG.SHEETS.SETTINGS);
   const last = sh.getLastRow();
   const values = sh.getRange(1, 1, last, 2).getValues();
+  let found = '';
   for (let i = 0; i < values.length; i++) {
-    if (String(values[i][0]) === key) return values[i][1];
+    if (String(values[i][0]) === key) {
+      found = values[i][1];
+      break;
+    }
   }
-  return '';
+
+  // 使い回すのは中身のある文字列だけ。
+  // 数値・日付・真偽値は型が変わると扱いが変わるので、そのつど読み直す。
+  // 見つからなかった場合も残さない（あとから設定されたらすぐ効くように）。
+  if (typeof found === 'string' && found !== '') {
+    writeSettingCache_(key, found);
+  }
+  return found;
+}
+
+function readSettingCache_(key) {
+  try {
+    const raw = CacheService.getScriptCache().get(SETTING_CACHE_KEY_PREFIX + key);
+    return raw ? raw : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeSettingCache_(key, value) {
+  try {
+    CacheService.getScriptCache().put(
+      SETTING_CACHE_KEY_PREFIX + key, value, SETTING_CACHE_SECONDS
+    );
+  } catch (e) {
+    // 使い回せなくても読み直せばよいので、失敗しても動作は変えない。
+  }
 }
 
 function computeNextReview_(isCorrect, existingReview, now) {
@@ -1372,10 +1467,6 @@ function computeNextReview_(isCorrect, existingReview, now) {
   const existing = dateFromCell_(existingReview);
   if (existing && existing.getTime() <= startOfDay_(now).getTime()) return '';
   return existingReview || '';
-}
-
-function getNodeNameByRow_(sheet, row) {
-  return String(sheet.getRange(row, 5).getValue() || ''); // E topic
 }
 
 function truthy_(v) {
