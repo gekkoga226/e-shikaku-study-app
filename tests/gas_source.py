@@ -137,6 +137,28 @@ def function_body(source: str, name: str) -> str:
     raise AssertionError(f'関数 {name} の終わりが見つかりません')
 
 
+def function_source(source: str, name: str) -> str:
+    """トップレベル関数 `name` の宣言全体（function ... { ... }）を返す。
+
+    実際にNodeで動かして挙動を確かめるために使う。
+    """
+    stripped = strip_literals(source)
+    match = re.search(r'\bfunction\s+' + re.escape(name) + r'\s*\(', stripped)
+    if not match:
+        raise AssertionError(f'関数 {name} が見つかりません')
+
+    start = stripped.index('{', match.end() - 1)
+    depth = 0
+    for pos in range(start, len(stripped)):
+        if stripped[pos] == '{':
+            depth += 1
+        elif stripped[pos] == '}':
+            depth -= 1
+            if depth == 0:
+                return source[match.start():pos + 1]
+    raise AssertionError(f'関数 {name} の終わりが見つかりません')
+
+
 def all_gas_sources():
     return {name: read(name) for name in GAS_FILES}
 

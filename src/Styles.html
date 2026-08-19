@@ -11,6 +11,34 @@
   --good: #157347;
   --bad: #b42318;
   --shadow: 0 10px 30px rgba(23, 32, 51, .08);
+
+  /*
+    拡大表示で画像に許す最大サイズ。
+    親要素の幅に対する % ではなく画面サイズから直接引いて決める。
+    （flexの中で % を使うと、はみ出したまま縮まないブラウザ挙動があるため）
+  */
+  --lightbox-bar: 60px;
+  --lightbox-max-w: calc(
+    100vw - 32px
+    - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)
+  );
+  --lightbox-max-h: calc(
+    100vh - var(--lightbox-bar) - 16px
+    - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)
+  );
+}
+/* iPhoneのアドレスバー伸縮で100vhが実画面より大きくなるため、使える環境ではdvhを優先する。 */
+@supports (height: 100dvh) {
+  :root {
+    --lightbox-max-w: calc(
+      100dvw - 32px
+      - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)
+    );
+    --lightbox-max-h: calc(
+      100dvh - var(--lightbox-bar) - 16px
+      - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)
+    );
+  }
 }
 * { box-sizing: border-box; }
 body {
@@ -113,9 +141,15 @@ button { touch-action: manipulation; }
 .badge.subtle { background: #f0f2f5; color: #475467; }
 .question-text { white-space: pre-wrap; font-size: 20px; line-height: 1.65; margin: 0 0 16px; }
 .question-images { display: grid; gap: 10px; margin: 12px 0 18px; }
+/*
+  通常表示の問題画像。
+  ・カード幅より大きい画像は縮めて全体を見せる（max-width: 100%）
+  ・小さい画像を引き伸ばさない（width: auto。width:100% にすると拡大されてぼやける）
+  ・縦横比は常に維持する（height: auto + object-fit: contain）
+*/
 .question-image {
-  display: block; width: 100%; height: auto;
-  max-width: 960px; max-height: 70vh; object-fit: contain;
+  display: block; width: auto; height: auto;
+  max-width: 100%; max-height: 70vh; object-fit: contain;
   margin: 0 auto; border-radius: 12px; border: 1px solid var(--line);
   cursor: zoom-in;
 }
@@ -134,8 +168,10 @@ button { touch-action: manipulation; }
 }
 .option-body { min-width: 0; }
 .option-text { white-space: pre-wrap; }
+.option-text:empty { display: none; }
+/* 選択肢画像も引き伸ばさず、選択肢の枠内に全体が収まるようにする。 */
 .option-image {
-  display: block; width: 100%; height: auto; max-width: 760px; max-height: 52vh;
+  display: block; width: auto; height: auto; max-width: 100%; max-height: 52vh;
   object-fit: contain; margin-top: 8px; border-radius: 10px;
 }
 .zoom-btn {
@@ -143,6 +179,7 @@ button { touch-action: manipulation; }
   background: #fff; border-color: var(--line); color: var(--accent);
   padding: 6px 8px;
 }
+.hint { margin: 4px 0 0; font-size: 13px; color: var(--muted); }
 .confidence-box { border-top: 1px solid var(--line); padding-top: 16px; margin-top: 12px; }
 .confidence-title { font-weight: 800; margin-bottom: 8px; }
 .confidence-options { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
@@ -165,17 +202,52 @@ button { touch-action: manipulation; }
   z-index: 100; width: min(92vw, 560px); padding: 12px 16px;
   color: #fff; background: #172033; border-radius: 12px; box-shadow: var(--shadow);
 }
+/*
+  画像の拡大表示。
+  見切れの原因は「上下のバー分の余白を引かずに max-height を決める」ことなので、
+  余白（バーの高さ + iPhoneのsafe-area）を calc で引いた高さを上限にする。
+  overflow:hidden で切り落とさず、はみ出す場合はこの枠の中をスクロールさせる。
+  中央寄せは margin:auto で行う（place-items:center は、はみ出したとき上端が切れる）。
+*/
 .lightbox {
   position: fixed; inset: 0; z-index: 200;
-  background: rgba(0,0,0,.88);
-  display: grid; place-items: center;
-  padding: 58px 12px 18px;
+  background: rgba(0,0,0,.92);
+  display: flex;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding:
+    calc(var(--lightbox-bar) + env(safe-area-inset-top, 0px))
+    max(12px, env(safe-area-inset-right, 0px))
+    max(16px, env(safe-area-inset-bottom, 0px))
+    max(12px, env(safe-area-inset-left, 0px));
 }
-.lightbox img { max-width: min(96vw, 1200px); max-height: 92vh; object-fit: contain; }
-.lightbox-close {
-  position: fixed; top: 10px; right: 10px;
+/* min-width: 0 が無いと、flexの中で画像が縮まずに右端がはみ出す。 */
+.lightbox-stage { margin: auto; min-width: 0; max-width: 100%; }
+/* 既定は「画面内へ縮小して全体を見せる」。縦横比は維持し、引き伸ばさない。 */
+.lightbox-image {
+  display: block;
+  width: auto; height: auto;
+  max-width: var(--lightbox-max-w);
+  max-height: var(--lightbox-max-h);
+  object-fit: contain;
+}
+/* 「原寸で見る」に切り替えたときだけ、原寸のままスクロールで端まで確認できる。 */
+.lightbox.zoomed .lightbox-stage { margin: 0; max-width: none; }
+.lightbox.zoomed .lightbox-image { max-width: none; max-height: none; }
+.lightbox-bar {
+  position: fixed;
+  top: env(safe-area-inset-top, 0px);
+  right: max(10px, env(safe-area-inset-right, 0px));
+  left: max(10px, env(safe-area-inset-left, 0px));
+  z-index: 1;
+  display: flex; justify-content: flex-end; gap: 8px;
+  padding: 8px 0;
+}
+.lightbox-btn {
   min-width: 48px; min-height: 44px; border: 0; border-radius: 10px;
-  background: #fff; color: #111; font-weight: 800;
+  padding: 8px 14px; background: #fff; color: #111; font-weight: 800;
+  cursor: pointer;
 }
 .ai-panel {
   margin-top: 18px; padding: 14px;

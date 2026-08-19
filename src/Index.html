@@ -33,6 +33,10 @@
         </div>
         <button id="startBtn" class="primary-btn big" type="button">弱点から1問解く</button>
         <button id="reviewBtn" class="secondary-btn" type="button">期限到来の復習をする</button>
+        <button id="unansweredBtn" class="secondary-btn" type="button">未回答問題を優先して解く</button>
+        <p id="unansweredNote" class="hint">
+          まだ一度も正式回答していない問題だけを出します。回答済みの問題は混ざりません。
+        </p>
       </div>
 
       <div id="dashboardGrid" class="metric-grid"></div>
@@ -48,9 +52,10 @@
 
     <section id="questionView" class="view hidden">
       <div id="questionLoading" class="panel centered hidden">
-        <div class="spinner" aria-hidden="true"></div>
-        <h2>問題を準備しています</h2>
+        <div id="loadingSpinner" class="spinner" aria-hidden="true"></div>
+        <h2 id="loadingTitle">問題を準備しています</h2>
         <p id="loadingMessage" class="muted">安全に表示できるか確認中です。</p>
+        <button id="noticeHomeBtn" class="secondary-btn hidden" type="button">ホームへ戻る</button>
       </div>
 
       <article id="questionCard" class="panel hidden">
@@ -107,8 +112,17 @@
   <div id="toast" class="toast hidden" role="status"></div>
 
   <div id="lightbox" class="lightbox hidden" role="dialog" aria-modal="true" aria-label="画像を拡大表示">
-    <button id="lightboxClose" class="lightbox-close" type="button">閉じる</button>
-    <img id="lightboxImage" alt="拡大画像">
+    <div class="lightbox-bar">
+      <button id="lightboxZoomBtn" class="lightbox-btn" type="button">原寸で見る</button>
+      <button id="lightboxClose" class="lightbox-btn" type="button">閉じる</button>
+    </div>
+    <!--
+      画像は「縮小して全体を見せる」が既定。原寸表示に切り替えたときだけ、
+      この枠の中をスクロールして端まで確認できる（切り落とさない）。
+    -->
+    <div class="lightbox-stage">
+      <img id="lightboxImage" class="lightbox-image" alt="拡大画像">
+    </div>
   </div>
 
   <?!= include('Client'); ?>
