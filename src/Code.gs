@@ -48,6 +48,19 @@ const LOG_PICK_COLUMNS = Object.freeze([
   'question_id', 'counts_for_mastery', 'is_correct', 'confidence', 'answered_at'
 ]);
 
+/*
+ * 02_マインドマップの読み取りに使う列だけ。
+ *
+ * このシートには理解度(M列)をはじめ、計算式の入った列が並んでいる。
+ * 全列を読むと、使わない列の数式まで再計算の完了を待つことになり、
+ * ホーム画面が返ってこなくなる。表示と出題順に使う列だけを読む。
+ */
+const MINDMAP_PICK_COLUMNS = Object.freeze([
+  'node_id', 'topic', 'major_area', 'mastery_pct', 'mastery_level',
+  'weighted_accuracy', 'required_unique_questions', 'primary_unique_answered_count',
+  'latest_unique_correct_count', 'next_review_at', 'last_answered_at', 'progress_eligible'
+]);
+
 /** 未回答かどうかの判定に必要な列だけ。 */
 const UNANSWERED_QUESTION_COLUMNS = Object.freeze([
   'question_id', 'question_text', 'correct_option', 'verification_status', 'active'
@@ -66,28 +79,94 @@ function include(filename) {
 }
 
 /**
- * ホーム画面の表示に必要なぶんだけを返す。
+ * ホーム画面の上半分（学習状況と理解度基準）だけを返す。
  *
- * 未回答の残数はここに含めない。残数を数えるには03_問題台帳と04_学習ログを
- * 端から端まで読む必要があり、それを待つあいだ理解度も弱点も表示できなくなるため、
- * getUnansweredSummary() として別の呼び出しに分けている。
+ * ホームの表示は、読むシートごとに3つの呼び出しへ分けている。
+ * 1つが遅くても他が表示され、どこで待たされているのかも切り分けられる。
+ *
+ *   getInitialData()        06_ダッシュボード + 00_設定
+ *   getWeaknessData()       02_マインドマップ（理解度の数式が並ぶ重いシート）
+ *   getUnansweredSummary()  03_問題台帳 + 04_学習ログ
  */
 function getInitialData() {
-  return {
+  const startedAt = Date.now();
+  const data = {
     dashboard: readDashboard_(),
-    weaknesses: readWeaknesses_(8),
     ruleVersion: readSettingValue_('mastery_rule_version') || '',
     generatedAt: formatDateTime_(new Date())
   };
+  logElapsed_('getInitialData', startedAt);
+  return data;
 }
 
 /** ホーム画面の「未回答問題を優先して解く（N問）」の残数だけを返す。 */
 function getUnansweredSummary() {
-  return readUnansweredSummary_();
+  const startedAt = Date.now();
+  const summary = readUnansweredSummary_();
+  logElapsed_('getUnansweredSummary', startedAt);
+  return summary;
 }
 
-function getWeaknessData() {
-  return readWeaknesses_(50);
+/**
+ * ホーム画面の「弱い論点」だけを返す。
+ *
+ * 02_マインドマップは理解度の数式が並ぶシートで、読むと再計算の完了を待つ。
+ * ここだけ独立した呼び出しにして、遅くても他の表示を止めないようにする。
+ * 結果は数分だけ使い回し、回答を書き込んだ直後は捨てる。
+ */
+function getWeaknessData(limit) {
+  const startedAt = Date.now();
+  const count = Math.min(Math.max(Number(limit) || WEAKNESS_DEFAULT_LIMIT, 1), WEAKNESS_CACHE_SIZE);
+
+  const cached = readWeaknessCache_();
+  if (cached) return cached.slice(0, count);
+
+  const weaknesses = readWeaknesses_(WEAKNESS_CACHE_SIZE);
+  writeWeaknessCache_(weaknesses);
+  logElapsed_('getWeaknessData', startedAt);
+  return weaknesses.slice(0, count);
+}
+
+const WEAKNESS_DEFAULT_LIMIT = 8;
+const WEAKNESS_CACHE_SIZE = 50;
+const WEAKNESS_CACHE_KEY = 'weakness_v1';
+const WEAKNESS_CACHE_SECONDS = 300;
+
+function readWeaknessCache_() {
+  try {
+    const raw = CacheService.getUserCache().get(WEAKNESS_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return Array.isArray(parsed) ? parsed : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeWeaknessCache_(weaknesses) {
+  try {
+    CacheService.getUserCache().put(
+      WEAKNESS_CACHE_KEY, JSON.stringify(weaknesses), WEAKNESS_CACHE_SECONDS
+    );
+  } catch (e) {
+    // 使い回せなくても読み直せばよいので、失敗しても動作は変えない。
+  }
+}
+
+/** 回答を書き込んだ直後に呼ぶ。次にホームを開いたとき理解度が新しくなる。 */
+function clearWeaknessCache_() {
+  try {
+    CacheService.getUserCache().remove(WEAKNESS_CACHE_KEY);
+  } catch (e) {}
+}
+
+/**
+ * どこで待たされているのかを実行ログへ残す。
+ * 出力先はApps Scriptの実行トランスクリプトだけで、画面にもシートにも出さない。
+ */
+function logElapsed_(label, startedAt) {
+  try {
+    console.log('[perf] ' + label + ': ' + (Date.now() - startedAt) + 'ms');
+  } catch (e) {}
 }
 
 /**
@@ -494,8 +573,9 @@ function submitAnswer(payload) {
     logSheet.getRange(targetRow, 17).setValue(masteryAfter); // Q snapshot
     SpreadsheetApp.flush();
 
-    // 1問解いたぶん、ホーム画面の未回答残数を数え直させる。
+    // 1問解いたぶん、ホーム画面の未回答残数と弱点リストを取り直させる。
     clearUnansweredSummaryCache_();
+    clearWeaknessCache_();
 
     return {
       ok: true,
@@ -1175,7 +1255,9 @@ function readWeaknesses_(limit) {
 }
 
 function readMindmapLeafNodes_() {
-  return readObjects_(APP_CONFIG.SHEETS.MINDMAP)
+  // このシートの値はどれも短いので、間に挟まる数列はまとめて読んでしまう。
+  // （読み飛ばすのは、右端に足された監査用の列のような遠い列だけでよい）
+  return readColumns_(APP_CONFIG.SHEETS.MINDMAP, MINDMAP_PICK_COLUMNS, { maxGap: 8 })
     .filter(r => truthy_(r.progress_eligible))
     .map(r => ({
       node_id: String(r.node_id || ''),
@@ -1276,9 +1358,15 @@ function spreadsheet_() {
  * 毎回運んでしまう。ここでは必要な列だけを、隣り合う列はまとめて
  * 1回の読み取りにして取り出す。
  */
-function readColumns_(sheetName, headers) {
+function readColumns_(sheetName, headers, options) {
   const sh = spreadsheet_().getSheetByName(sheetName);
   if (!sh) return [];
+
+  // 読み飛ばす列が少しだけのときは、まとめて読んだほうが速い。
+  // 往復1回（数十ms）に対し、短いセルを数百個よけいに運ぶのは一瞬で終わる。
+  // 03_問題台帳のように1セルが数千文字の列を挟む場合は既定の0のまま使い、
+  // 02_マインドマップのように短い値ばかりのシートだけ隙間をまたぐ。
+  const maxGap = options && Number(options.maxGap) > 0 ? Number(options.maxGap) : 0;
 
   const lastRow = sheetName === APP_CONFIG.SHEETS.LOG
     ? lastLogicalNonEmptyRowInColumnA_(sh)
@@ -1298,7 +1386,7 @@ function readColumns_(sheetName, headers) {
   const runs = [];
   wanted.forEach(item => {
     const current = runs.length ? runs[runs.length - 1] : null;
-    if (current && item.col === current.end + 1) {
+    if (current && item.col - current.end - 1 <= maxGap) {
       current.end = item.col;
       current.items.push(item);
     } else {

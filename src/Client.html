@@ -36,23 +36,68 @@
     loadHomeData();
   });
 
+  /*
+   * ホームの表示は、読むシートごとに3つの呼び出しへ分けている。
+   * 1つが遅くても残りは表示され、どこで待たされているかも画面から分かる。
+   *
+   *   getInitialData()        06_ダッシュボード + 00_設定
+   *   getWeaknessData()       02_マインドマップ（理解度の数式が並ぶ重いシート）
+   *   getUnansweredSummary()  03_問題台帳 + 04_学習ログ
+   */
   function loadHomeData() {
-    $('ruleLabel').textContent = '理解度を読み込み中...';
+    const waiting = startWaitingNotice('ruleLabel', '理解度を読み込み中...');
 
     google.script.run
       .withSuccessHandler(data => {
-        $('ruleLabel').textContent = data.ruleVersion
+        waiting.stop();
+        $('ruleLabel').textContent = data && data.ruleVersion
           ? '理解度基準: ' + data.ruleVersion
           : '理解度基準をシートから読み込み';
-        renderDashboard(data.dashboard || []);
-        renderWeaknesses(data.weaknesses || []);
+        renderDashboard((data && data.dashboard) || []);
       })
-      .withFailureHandler(showHomeError)
+      .withFailureHandler(err => { waiting.stop(); showHomeError(err); })
       .getInitialData();
+
+    // 02_マインドマップは理解度の数式が並ぶため、読むと再計算の完了を待つ。
+    // 学習状況の表示を止めないよう、別の呼び出しにして後から差し込む。
+    loadWeaknesses();
 
     // 残数の集計は03_問題台帳と04_学習ログを端から端まで読むため重い。
     // 理解度や弱点の表示を待たせないよう、別の呼び出しにして後から差し込む。
     loadUnansweredSummary();
+  }
+
+  function loadWeaknesses() {
+    const waiting = startWaitingNotice('weaknessHint', '理解度が低い順');
+
+    google.script.run
+      .withSuccessHandler(items => {
+        waiting.stop();
+        $('weaknessHint').textContent = '理解度が低い順';
+        renderWeaknesses(items || []);
+      })
+      .withFailureHandler(() => {
+        waiting.stop();
+        $('weaknessHint').textContent = '読み込めませんでした';
+      })
+      .getWeaknessData();
+  }
+
+  /*
+   * 待たされていることを画面に出す。
+   * 黙ったまま止まって見えると、遅いのか壊れたのかが分からない。
+   */
+  function startWaitingNotice(elementId, label) {
+    const startedAt = Date.now();
+    $(elementId).textContent = label;
+
+    const timer = window.setInterval(() => {
+      const seconds = Math.round((Date.now() - startedAt) / 1000);
+      if (seconds < 8) return;
+      $(elementId).textContent = label + '（' + seconds + '秒経過）';
+    }, 1000);
+
+    return { stop: () => window.clearInterval(timer) };
   }
 
   function loadUnansweredSummary() {
