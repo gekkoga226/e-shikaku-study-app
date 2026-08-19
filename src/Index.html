@@ -37,6 +37,7 @@
         <p id="unansweredNote" class="hint">
           まだ一度も正式回答していない問題だけを出します。回答済みの問題は混ざりません。
         </p>
+        <button id="genreBtn" class="secondary-btn" type="button">ジャンル別の弱点を見る</button>
       </div>
 
       <div id="dashboardGrid" class="metric-grid"></div>
@@ -47,6 +48,31 @@
           <span id="weaknessHint" class="muted">理解度が低い順</span>
         </div>
         <div id="weaknessList" class="weakness-list"></div>
+      </section>
+    </section>
+
+    <section id="genreView" class="view hidden">
+      <section class="panel">
+        <div class="section-head">
+          <h2>ジャンル別の弱点</h2>
+          <span id="genreHint" class="muted">読み込み中...</span>
+        </div>
+        <p class="hint">
+          正答率が低いジャンルから並べています。数字はすべて
+          02_マインドマップ（理解度の計算元）の値をそのまま合計したものです。
+        </p>
+        <div id="genreTotals" class="metric-grid"></div>
+        <div id="genreList" class="genre-list"></div>
+        <div class="genre-actions">
+          <button id="genreMistakeBtn" class="secondary-btn" type="button">
+            これまでに間違えた問題数も見る
+          </button>
+          <p id="genreMistakeNote" class="hint">
+            帯グラフの「誤答」は、理解度と同じく<strong>最新の正式回答が不正解</strong>の問題数です。
+            一度間違えたあと復習で正解にできた問題は含みません。
+          </p>
+        </div>
+        <button id="genreHomeBtn" class="secondary-btn big" type="button">ホームへ戻る</button>
       </section>
     </section>
 

@@ -124,6 +124,48 @@ button { touch-action: manipulation; }
 .weakness-name { font-weight: 800; }
 .progress-track { grid-column: 1 / -1; height: 8px; background: #edf0f5; border-radius: 999px; overflow: hidden; }
 .progress-bar { height: 100%; background: var(--accent); border-radius: inherit; }
+/*
+  ジャンル別の弱点。
+  帯グラフは「最新正解 / 最新誤答 / 未回答」の3つを横に並べる。
+  幅は % で与えるが、0%のときは要素ごと出さない（1pxの線が残らないように）。
+*/
+.genre-list { display: grid; gap: 12px; margin-top: 14px; }
+.genre-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: #fff;
+}
+.genre-head {
+  display: flex; flex-wrap: wrap; align-items: baseline;
+  justify-content: space-between; gap: 6px;
+}
+.genre-name { font-weight: 800; font-size: 16px; }
+.genre-rates { color: var(--muted); font-size: 13px; }
+.genre-bar {
+  display: flex; height: 12px; margin: 9px 0 7px;
+  background: #edf0f5; border-radius: 999px; overflow: hidden;
+}
+.genre-seg { height: 100%; }
+.genre-seg.correct { background: var(--good); }
+.genre-seg.wrong { background: var(--bad); }
+.genre-seg.unanswered { background: #d3d9e4; }
+.genre-numbers { font-size: 13px; color: var(--muted); }
+.genre-numbers b { color: var(--text); }
+.genre-toggle {
+  margin-top: 8px; min-height: 36px; padding: 0 10px;
+  font-size: 13px; font-weight: 700;
+  background: transparent; color: var(--accent);
+  border: 1px solid #b7c7f5; border-radius: 8px; cursor: pointer;
+}
+.genre-topics { display: grid; gap: 9px; margin-top: 10px; }
+.genre-topic {
+  border-top: 1px solid var(--line); padding-top: 9px;
+}
+.genre-topic-name { font-weight: 700; font-size: 14px; }
+.genre-actions { margin-top: 16px; }
+.genre-mistakes { font-size: 13px; margin-top: 4px; }
+
 .centered { text-align: center; padding: 34px 18px; }
 .spinner {
   width: 36px; height: 36px; border-radius: 50%;
