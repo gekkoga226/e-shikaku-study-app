@@ -22,8 +22,37 @@ const APP_CONFIG = Object.freeze({
   },
   // learning / review は従来どおり。unanswered は未回答だけを消化する独立モード。
   MODES: ['learning', 'review', 'unanswered'],
-  MAX_CLIENT_EXCLUDES: 30
+  MAX_CLIENT_EXCLUDES: 30,
+  // 未回答の残数は毎回数えると重いので、この秒数だけ結果を使い回す。
+  // 回答を書き込んだ直後は submitAnswer 側で破棄するので、数字が古いまま残らない。
+  UNANSWERED_CACHE_SECONDS: 300
 });
+
+/*
+ * 読み取る列を必要最小限に絞るための一覧。
+ *
+ * 03_問題台帳には解説（explanation_*）や根拠（answer_evidence）など、
+ * 1セルが数百〜数千文字になる列がある。出題の判定にはどれも使わないため、
+ * ここに挙げた列だけを読む。読む量が減るぶん表示が速くなり、
+ * 回答前に解説や根拠をサーバーへ載せないという意味でも安全側になる。
+ */
+const QUESTION_PICK_COLUMNS = Object.freeze([
+  'question_id', 'question_text', 'correct_option', 'answer_type',
+  'primary_node_id', 'verification_status', 'active', 'difficulty', 'question_image_refs',
+  'option_a', 'option_b', 'option_c', 'option_d',
+  'option_e', 'option_f', 'option_g', 'option_h'
+]);
+
+/** 出題の優先順位づけに使う04_学習ログの列だけ。 */
+const LOG_PICK_COLUMNS = Object.freeze([
+  'question_id', 'counts_for_mastery', 'is_correct', 'confidence', 'answered_at'
+]);
+
+/** 未回答かどうかの判定に必要な列だけ。 */
+const UNANSWERED_QUESTION_COLUMNS = Object.freeze([
+  'question_id', 'question_text', 'correct_option', 'verification_status', 'active'
+]);
+const UNANSWERED_LOG_COLUMNS = Object.freeze(['question_id', 'counts_for_mastery']);
 
 function doGet() {
   return HtmlService.createTemplateFromFile('Index')
@@ -36,14 +65,25 @@ function include(filename) {
   return HtmlService.createHtmlOutputFromFile(filename).getContent();
 }
 
+/**
+ * ホーム画面の表示に必要なぶんだけを返す。
+ *
+ * 未回答の残数はここに含めない。残数を数えるには03_問題台帳と04_学習ログを
+ * 端から端まで読む必要があり、それを待つあいだ理解度も弱点も表示できなくなるため、
+ * getUnansweredSummary() として別の呼び出しに分けている。
+ */
 function getInitialData() {
   return {
     dashboard: readDashboard_(),
     weaknesses: readWeaknesses_(8),
-    unanswered: readUnansweredSummary_(),
     ruleVersion: readSettingValue_('mastery_rule_version') || '',
     generatedAt: formatDateTime_(new Date())
   };
+}
+
+/** ホーム画面の「未回答問題を優先して解く（N問）」の残数だけを返す。 */
+function getUnansweredSummary() {
+  return readUnansweredSummary_();
 }
 
 function getWeaknessData() {
@@ -62,8 +102,8 @@ function getNextQuestion(request) {
   const mode = normalizeMode_(request.mode);
   const excludes = new Set((request.excludeQuestionIds || []).slice(-APP_CONFIG.MAX_CLIENT_EXCLUDES));
 
-  const formal = readObjects_(APP_CONFIG.SHEETS.QUESTIONS).filter(isFormalQuestion_);
-  const logs = readObjects_(APP_CONFIG.SHEETS.LOG);
+  const formal = readColumns_(APP_CONFIG.SHEETS.QUESTIONS, QUESTION_PICK_COLUMNS).filter(isFormalQuestion_);
+  const logs = readColumns_(APP_CONFIG.SHEETS.LOG, LOG_PICK_COLUMNS);
 
   // 未回答モードは独立した出題経路。既存のPhase8優先ロジックには入らない。
   if (mode === 'unanswered') {
@@ -243,16 +283,60 @@ function answeredQuestionIdSet_(logs) {
   return answered;
 }
 
-/** ホーム画面の「未回答問題を優先して解く（N問）」に出す残数。 */
+/**
+ * ホーム画面の「未回答問題を優先して解く（N問）」に出す残数。
+ *
+ * 数え方は出題側と同じ（isFormalQuestion_ と answeredQuestionIdSet_）。
+ * 判定に使う列だけを読み、結果は数分だけ使い回す。
+ */
 function readUnansweredSummary_() {
-  const formal = readObjects_(APP_CONFIG.SHEETS.QUESTIONS).filter(isFormalQuestion_);
-  const answered = answeredQuestionIdSet_(readObjects_(APP_CONFIG.SHEETS.LOG));
+  const cached = readUnansweredSummaryCache_();
+  if (cached) return cached;
+
+  const formal = readColumns_(APP_CONFIG.SHEETS.QUESTIONS, UNANSWERED_QUESTION_COLUMNS)
+    .filter(isFormalQuestion_);
+  const answered = answeredQuestionIdSet_(
+    readColumns_(APP_CONFIG.SHEETS.LOG, UNANSWERED_LOG_COLUMNS)
+  );
   const remaining = formal.filter(q => !answered.has(String(q.question_id))).length;
-  return {
+
+  const summary = {
     formal_total: formal.length,
     answered_unique: formal.length - remaining,
     remaining: remaining
   };
+  writeUnansweredSummaryCache_(summary);
+  return summary;
+}
+
+const UNANSWERED_CACHE_KEY = 'unanswered_summary_v1';
+
+function readUnansweredSummaryCache_() {
+  try {
+    const raw = CacheService.getUserCache().get(UNANSWERED_CACHE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeUnansweredSummaryCache_(summary) {
+  try {
+    CacheService.getUserCache().put(
+      UNANSWERED_CACHE_KEY,
+      JSON.stringify(summary),
+      APP_CONFIG.UNANSWERED_CACHE_SECONDS
+    );
+  } catch (e) {
+    // 使い回せなくても数え直せばよいので、失敗しても動作は変えない。
+  }
+}
+
+/** 回答を書き込んだ直後に呼ぶ。次にホームを開いたとき残数が1問減る。 */
+function clearUnansweredSummaryCache_() {
+  try {
+    CacheService.getUserCache().remove(UNANSWERED_CACHE_KEY);
+  } catch (e) {}
 }
 
 function normalizeMode_(mode) {
@@ -367,6 +451,9 @@ function submitAnswer(payload) {
     const masteryAfter = numberOrZero_(mapSheet.getRange(nodeRow, 13).getValue());
     logSheet.getRange(targetRow, 17).setValue(masteryAfter); // Q snapshot
     SpreadsheetApp.flush();
+
+    // 1問解いたぶん、ホーム画面の未回答残数を数え直させる。
+    clearUnansweredSummaryCache_();
 
     return {
       ok: true,
@@ -939,8 +1026,7 @@ function checkAiSetup() {
 /* ----------------------------- internal helpers ----------------------------- */
 
 function readDashboard_() {
-  const ss = SpreadsheetApp.openById(APP_CONFIG.SPREADSHEET_ID);
-  const sh = ss.getSheetByName(APP_CONFIG.SHEETS.DASHBOARD);
+  const sh = spreadsheet_().getSheetByName(APP_CONFIG.SHEETS.DASHBOARD);
   const values = sh.getRange(2, 1, 9, 3).getDisplayValues();
   return values.map(r => ({ label: r[0], value: r[1], definition: r[2] })).filter(x => x.label);
 }
@@ -1034,8 +1120,76 @@ function latestFormalLogByQuestion_(logs) {
   return out;
 }
 
+/*
+ * スプレッドシートを開く回数を1回にまとめる。
+ *
+ * openById は呼ぶたびに通信が発生する。1回の画面表示で5回開いていたため、
+ * その分だけ待ち時間が増えていた。実行が終われば変数ごと消えるので、
+ * 古いデータを持ち続けることはない。
+ */
+let SPREADSHEET_HANDLE_ = null;
+
+function spreadsheet_() {
+  if (!SPREADSHEET_HANDLE_) {
+    SPREADSHEET_HANDLE_ = SpreadsheetApp.openById(APP_CONFIG.SPREADSHEET_ID);
+  }
+  return SPREADSHEET_HANDLE_;
+}
+
+/**
+ * 指定した見出しの列だけを読む。
+ *
+ * readObjects_ はシート全体（全列）を読むため、解説のような長い文章まで
+ * 毎回運んでしまう。ここでは必要な列だけを、隣り合う列はまとめて
+ * 1回の読み取りにして取り出す。
+ */
+function readColumns_(sheetName, headers) {
+  const sh = spreadsheet_().getSheetByName(sheetName);
+  if (!sh) return [];
+
+  const lastRow = sheetName === APP_CONFIG.SHEETS.LOG
+    ? lastLogicalNonEmptyRowInColumnA_(sh)
+    : sh.getLastRow();
+  if (lastRow < 2) return [];
+
+  const map = headerMap_(sh);
+  const wanted = [];
+  headers.forEach(header => {
+    if (map[header]) wanted.push({ header: header, col: map[header] });
+  });
+  if (!wanted.length) return [];
+  wanted.sort((a, b) => a.col - b.col);
+
+  // 連続している列はひとまとめにして読む（読み取り回数を減らすため）。
+  // 間に挟まる不要な列は範囲を切って飛ばす。
+  const runs = [];
+  wanted.forEach(item => {
+    const current = runs.length ? runs[runs.length - 1] : null;
+    if (current && item.col === current.end + 1) {
+      current.end = item.col;
+      current.items.push(item);
+    } else {
+      runs.push({ start: item.col, end: item.col, items: [item] });
+    }
+  });
+
+  const count = lastRow - 1;
+  const rows = new Array(count);
+  for (let i = 0; i < count; i++) rows[i] = { _sheet_row: i + 2 };
+
+  runs.forEach(run => {
+    const values = sh.getRange(2, run.start, count, run.end - run.start + 1).getValues();
+    run.items.forEach(item => {
+      const offset = item.col - run.start;
+      for (let i = 0; i < count; i++) rows[i][item.header] = values[i][offset];
+    });
+  });
+
+  return rows.filter(row => headers.some(h => row[h] !== '' && row[h] != null));
+}
+
 function readObjects_(sheetName) {
-  const ss = SpreadsheetApp.openById(APP_CONFIG.SPREADSHEET_ID);
+  const ss = spreadsheet_();
   const sh = ss.getSheetByName(sheetName);
   const lastRow = sheetName === APP_CONFIG.SHEETS.LOG
     ? lastLogicalNonEmptyRowInColumnA_(sh)
@@ -1090,7 +1244,9 @@ function findLogicalNextLogRow_(sheet) {
 }
 
 function lastLogicalNonEmptyRowInColumnA_(sheet) {
-  const max = sheet.getMaxRows();
+  // U列の数式などが下まで入っていると getMaxRows() は実データよりずっと大きい。
+  // 値のある最終行（getLastRow）より下にA列のデータは無いので、そこまでで足りる。
+  const max = Math.min(sheet.getMaxRows(), Math.max(sheet.getLastRow(), 1));
   if (max < 2) return 1;
   const values = sheet.getRange(2, 1, max - 1, 1).getValues();
   for (let i = values.length - 1; i >= 0; i--) {
@@ -1105,8 +1261,7 @@ function ensureLogCapacity_(sheet, row) {
 }
 
 function readSettingValue_(key) {
-  const ss = SpreadsheetApp.openById(APP_CONFIG.SPREADSHEET_ID);
-  const sh = ss.getSheetByName(APP_CONFIG.SHEETS.SETTINGS);
+  const sh = spreadsheet_().getSheetByName(APP_CONFIG.SHEETS.SETTINGS);
   const last = sh.getLastRow();
   const values = sh.getRange(1, 1, last, 2).getValues();
   for (let i = 0; i < values.length; i++) {

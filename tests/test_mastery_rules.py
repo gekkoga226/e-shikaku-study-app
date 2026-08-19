@@ -145,6 +145,8 @@ class TestSelfTestsAreNonDestructive(unittest.TestCase):
         for func, filename in (
             ('runSelfTest', 'Code.gs'),
             ('runImageSupportSelfTest', 'ImageSelfTest.gs'),
+            ('runImageOptionMappingSelfTest', 'ImageSelfTest.gs'),
+            ('runQuestionContentAudit', 'ImageSelfTest.gs'),
             ('runImageBundleSmokeTest', 'ImageSelfTest.gs'),
         ):
             body = strip_literals(function_body(read(filename), func))
@@ -158,6 +160,8 @@ class TestSelfTestsAreNonDestructive(unittest.TestCase):
         for func, filename in (
             ('runSelfTest', 'Code.gs'),
             ('runImageSupportSelfTest', 'ImageSelfTest.gs'),
+            ('runImageOptionMappingSelfTest', 'ImageSelfTest.gs'),
+            ('runQuestionContentAudit', 'ImageSelfTest.gs'),
             ('runImageBundleSmokeTest', 'ImageSelfTest.gs'),
         ):
             body = strip_literals(function_body(read(filename), func))
