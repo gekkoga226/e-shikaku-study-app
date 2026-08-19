@@ -76,6 +76,7 @@ E資格の勉強用 学習Webアプリ（Google Apps Script）と、
 │   ├── test_image_display.py       画像の見切れ防止（CSS）の守り
 │   ├── test_image_option_mapping.py 画像4択 A/B/C/D 対応の守り
 │   ├── test_unanswered_mode.py     未回答優先モードの守り
+│   ├── test_sheet_reads.py         シート読み取りの重さの守り（表示速度）
 │   ├── test_answer_secrecy.py      正解漏洩防止の守り
 │   ├── test_ai_explanation.py      AI補助解説の守り（回答後だけ／キー非公開）
 │   └── test_repo_config.py         設定・権限・ワークフローの守り
@@ -201,7 +202,23 @@ Apps Scriptのエディタから実行できます。いずれも `04_学習ロ�
 - `runImageSupportSelfTest()` — 画像manifestの整合性確認
 - `runImageOptionMappingSelfTest()` — 画像4択 A/B/C/D の対応確認
 - `runImageBundleSmokeTest()` — Drive権限と実画像展開の確認
+- `runQuestionContentAudit()` — **解くのに情報が足りない問題の洗い出し**（下記）
 - `checkAiSetup()` — `GEMINI_API_KEY` の登録とGeminiへの接続確認
+
+### 解くのに情報が足りない問題を洗い出す
+
+「図を見ないと解けないのに画像が無い」「（あ）とあるのに前提の文章が無い」といった
+**03_問題台帳の中身の不足**は、アプリ側では直せません。
+`runQuestionContentAudit()` を実行すると、該当する `question_id` の一覧がログに出ます。
+
+| 理由 | 意味 | 直し方 |
+|---|---|---|
+| `NEEDS_IMAGE` | 本文が図・グラフを指しているのに `question_image_refs` が空 | 画像を登録するか、図を使わない本文に書き直す |
+| `MISSING_CONTEXT` | `（あ）` などの空欄を指しているのに、本文にその前提が無い | 元の問題文（前提の段落）を本文へ補う |
+| `OPTION_PLACEHOLDER` | 選択肢が `[Aの画像選択肢]` のままで画像が無い | 選択肢画像を登録するか、文字の選択肢に書き直す |
+| `NO_EXPLANATION` | `explanation_*` がすべて空 | 解説を登録する（AI補助解説の材料にもなる） |
+
+この監査は**読み取りだけ**で、スプレッドシートには何も書き込みません。
 
 ---
 

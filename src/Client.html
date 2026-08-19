@@ -34,6 +34,8 @@
   });
 
   function loadHomeData() {
+    $('ruleLabel').textContent = '理解度を読み込み中...';
+
     google.script.run
       .withSuccessHandler(data => {
         $('ruleLabel').textContent = data.ruleVersion
@@ -41,10 +43,22 @@
           : '理解度基準をシートから読み込み';
         renderDashboard(data.dashboard || []);
         renderWeaknesses(data.weaknesses || []);
-        renderUnansweredButton(data.unanswered);
       })
-      .withFailureHandler(showServerError)
+      .withFailureHandler(showHomeError)
       .getInitialData();
+
+    // 残数の集計は03_問題台帳と04_学習ログを端から端まで読むため重い。
+    // 理解度や弱点の表示を待たせないよう、別の呼び出しにして後から差し込む。
+    loadUnansweredSummary();
+  }
+
+  function loadUnansweredSummary() {
+    $('unansweredBtn').textContent = '未回答問題を優先して解く（数えています…）';
+
+    google.script.run
+      .withSuccessHandler(renderUnansweredButton)
+      .withFailureHandler(() => renderUnansweredButton(null))
+      .getUnansweredSummary();
   }
 
   // 残数はサーバー（＝04_学習ログのcounts_for_mastery）が数えた値をそのまま出す。
@@ -59,6 +73,13 @@
     btn.textContent = remaining > 0
       ? '未回答問題を優先して解く（' + remaining + '問）'
       : '未回答問題を優先して解く（すべて解答済み）';
+  }
+
+  // ホーム画面での失敗は、問題画面用の表示では見えない。ここで理由を残す。
+  function showHomeError(err) {
+    const msg = err && err.message ? err.message : String(err || '不明なエラー');
+    $('ruleLabel').textContent = '学習状況を読み込めませんでした';
+    showToast(msg);
   }
 
   function renderDashboard(items) {

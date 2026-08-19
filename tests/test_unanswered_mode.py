@@ -358,10 +358,36 @@ class TestUnansweredSummary(unittest.TestCase):
             self.assertNotIn(field, body,
                              f'U列の数式と別に {field} を判定し直しています')
 
-    def test_initial_data_exposes_the_remaining_count(self):
-        body = strip_comments(function_body(CODE, 'getInitialData'))
+    def test_remaining_count_has_its_own_server_call(self):
+        """残数の集計は重いので、ホーム画面の表示をブロックしない別呼び出しにする。"""
+        body = strip_comments(function_body(CODE, 'getUnansweredSummary'))
         self.assertIn('readUnansweredSummary_()', body,
-                      'ホーム画面へ未回答の残数を渡していません')
+                      '未回答の残数を返す入口がありません')
+
+        initial = strip_comments(function_body(CODE, 'getInitialData'))
+        self.assertNotIn('readUnansweredSummary_', initial,
+                         'ホーム画面の初回表示が、重い残数集計の完了を待っています')
+
+    def test_summary_reads_only_the_columns_it_needs(self):
+        """解説など長い列まで読むと、ホーム画面が返ってこなくなる。"""
+        body = strip_comments(function_body(CODE, 'readUnansweredSummary_'))
+        self.assertIn('readColumns_(', body, '列を絞らずシート全体を読んでいます')
+        self.assertNotIn('readObjects_(', body, '全列読み取りが残っています')
+
+        for name in ('UNANSWERED_QUESTION_COLUMNS', 'UNANSWERED_LOG_COLUMNS'):
+            columns = re.search(
+                r'const ' + name + r' = Object\.freeze\(\[([\s\S]*?)\]\)', CODE
+            )
+            self.assertIsNotNone(columns, f'{name} が見つかりません')
+            for forbidden in ('explanation', 'answer_evidence'):
+                self.assertNotIn(forbidden, columns.group(1),
+                                 f'{name} が重い列 {forbidden} を読もうとしています')
+
+    def test_count_is_refreshed_after_answering(self):
+        """回答したぶん残数が減るよう、書き込み後に使い回しをやめる。"""
+        body = strip_comments(function_body(CODE, 'submitAnswer'))
+        self.assertIn('clearUnansweredSummaryCache_()', body,
+                      '回答後も古い残数が表示され続けます')
 
 
 class TestClientUnansweredMode(unittest.TestCase):
@@ -392,6 +418,29 @@ class TestClientUnansweredMode(unittest.TestCase):
         body = strip_comments(function_body(self.script, 'renderUnansweredButton'))
         self.assertIn('未回答問題を優先して解く', body, 'ボタンの表示名がありません')
         self.assertIn('summary.remaining', body, '残数を使っていません')
+
+    def test_home_does_not_wait_for_the_count(self):
+        """残数の集計が遅くても、理解度と弱点は先に表示されること。"""
+        body = strip_comments(function_body(self.script, 'loadHomeData'))
+        self.assertIn('.getInitialData()', body, 'ホームの読み込みがありません')
+        self.assertIn('loadUnansweredSummary()', body,
+                      '残数を別呼び出しにしていません')
+
+        summary = strip_comments(function_body(self.script, 'loadUnansweredSummary'))
+        self.assertIn('.getUnansweredSummary()', summary,
+                      '残数専用のサーバー呼び出しを使っていません')
+        for forbidden in ('renderWeaknesses(', 'renderDashboard('):
+            self.assertNotIn(forbidden, summary,
+                             f'残数の取得が {forbidden} を巻き込んでいます')
+
+    def test_home_failure_is_visible(self):
+        """ホームで失敗したとき、問題画面用の表示では気づけない。"""
+        body = strip_comments(function_body(self.script, 'loadHomeData'))
+        self.assertIn('showHomeError', body, 'ホーム専用の失敗表示がありません')
+
+        handler = strip_comments(function_body(self.script, 'showHomeError'))
+        self.assertIn("$('ruleLabel')", handler,
+                      '失敗しても「読み込み中」の表示のままになります')
 
     def test_completion_does_not_fall_back_to_answered_questions(self):
         body = strip_comments(function_body(self.script, 'loadNextQuestion'))
