@@ -77,6 +77,7 @@ E資格の勉強用 学習Webアプリ（Google Apps Script）と、
 │   ├── test_image_option_mapping.py 画像4択 A/B/C/D 対応の守り
 │   ├── test_unanswered_mode.py     未回答優先モードの守り
 │   ├── test_sheet_reads.py         シート読み取りの重さの守り（表示速度）
+│   ├── test_home_speed.py          ホーム画面の速さの守り（読む列・呼び出しの分割）
 │   ├── test_question_speed.py      出題の速さの守り（点検の回数・選ばれる問題の同一性）
 │   ├── test_answer_speed.py        回答処理の速さの守り（往復回数・確定手順）
 │   ├── test_answer_secrecy.py      正解漏洩防止の守り
@@ -183,6 +184,17 @@ main への push
 
 理解度・採点・画像の各ルールを1つも変えずに、往復の回数だけを減らす。
 
+- `02_マインドマップ` を全列読みしない。このシートには理解度（M列）をはじめ
+  計算式の入った列が並んでおり、全部読むと使わない列の再計算まで待つことになる。
+  表示と出題順に使う列だけを読む（`MINDMAP_PICK_COLUMNS`）
+- ホームの表示は、読むシートごとに独立した呼び出しに分ける。
+  1つが遅くても、他の表示と学習の開始を止めない
+  （`getInitialData` = 06+00 ／ `getWeaknessData` = 02 ／ `getUnansweredSummary` = 03+04）
+- ホームの弱点リストは数分だけ使い回し、回答を書き込んだ直後に捨てる。
+  ただし**出題の優先順位に使う理解度は使い回さない**
+  （`readMindmapLeafNodes_` は毎回シートの現在値を読む）
+- 読み飛ばす列がわずかなら、まとめて読んだほうが速い（`readColumns_` の `maxGap`）。
+  ただし `03_問題台帳` のように1セルが数千文字の列を挟むシートでは既定の0のまま使う
 - 画像を用意できるかの点検（`imageSupportAllowsQuestionObject_`）を、出題候補の
   全部に先まわしでかけない。優先順位で並べたあと、上から順に必要なぶんだけ点検する。
   点検1回につきキャッシュ参照2回とSHA-256計算1回が走るため、
