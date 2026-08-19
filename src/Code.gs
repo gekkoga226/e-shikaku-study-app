@@ -556,7 +556,11 @@ const AI_CONFIG = Object.freeze({
   CACHE_SECONDS: 3600,
   MAX_CACHE_CHARS: 90000,
   MAX_IMAGE_PARTS: 8,
-  MAX_OUTPUT_TOKENS: 1600,
+  // 本文は日本語800〜1200文字を求めている。日本語はおおむね1文字1トークン以上で、
+  // LaTeXの記号もトークンを食う。さらに今のモデルは答える前に内部で考え、
+  // その思考ぶんもこの上限に含まれる。1600では考えている途中で打ち切られ、
+  // 解説が文の途中で切れていた。実際に必要な量の数倍を確保しておく。
+  MAX_OUTPUT_TOKENS: 8192,
   TEMPERATURE: 0.3
 });
 
@@ -634,6 +638,7 @@ function getAiExplanation(request) {
       attempt_id: attemptId,
       model: String(cached.model || ''),
       text: String(cached.text),
+      truncated: cached.truncated === true,
       cached: true,
       disclaimer: AI_DISCLAIMER
     };
@@ -657,13 +662,18 @@ function getAiExplanation(request) {
   const generated = callGeminiGenerateContent_(model, apiKey, parts);
   if (!generated.ok) return generated;
 
-  aiCachePut_(cacheKey, { model: model, text: generated.text });
+  // 途中で切れた解説をキャッシュすると、1時間ずっと切れたものが再表示される。
+  // 切れたときは残さず、「もう一度作る」で作り直せるようにする。
+  if (generated.truncated !== true) {
+    aiCachePut_(cacheKey, { model: model, text: generated.text });
+  }
 
   return {
     ok: true,
     attempt_id: attemptId,
     model: model,
     text: generated.text,
+    truncated: generated.truncated === true,
     cached: false,
     disclaimer: AI_DISCLAIMER
   };
@@ -892,13 +902,88 @@ function callGeminiGenerateContent_(model, apiKey, parts) {
   }
 
   const candidates = data.candidates || [];
-  const content = candidates.length ? (candidates[0].content || {}) : {};
-  const raw = (content.parts || []).map(p => String(p.text || '')).join('').trim();
+  const candidate = candidates.length ? (candidates[0] || {}) : {};
+  const content = candidate.content || {};
+  // thought: true の part はモデルの内部の考えであって解説本文ではない。
+  // これを混ぜると、本文の前に思考の断片が出てしまう。
+  const raw = (content.parts || [])
+    .filter(p => p && p.thought !== true)
+    .map(p => String(p.text || ''))
+    .join('')
+    .trim();
+
+  const finishReason = String(candidate.finishReason || '').toUpperCase();
+  if (finishReason === 'SAFETY' || finishReason === 'PROHIBITED_CONTENT') {
+    return aiFailure_('AI_BLOCKED', 'AI側の安全フィルタにより、この問題の補助解説は作れませんでした。');
+  }
+  if (finishReason === 'RECITATION') {
+    return aiFailure_('AI_BLOCKED', 'AIが引用制限により補助解説を作れませんでした。もう一度お試しください。');
+  }
+
   if (!raw) {
+    if (finishReason === 'MAX_TOKENS') {
+      return aiFailure_(
+        'AI_TRUNCATED_EMPTY',
+        'AIが考えている途中で長さの上限に達し、解説を作れませんでした。もう一度お試しください。'
+      );
+    }
     return aiFailure_('AI_EMPTY_RESPONSE', 'AIから補助解説が返りませんでした。もう一度お試しください。');
   }
 
-  return { ok: true, text: aiPlainText_(raw) };
+  // 上限に当たった場合、本文は文の途中で終わっている。黙って出すと
+  // 「なぜか途中で切れている解説」に見えるので、切れたことを画面へ伝える。
+  return { ok: true, text: aiPlainText_(raw), truncated: finishReason === 'MAX_TOKENS' };
+}
+
+/**
+ * 対になっていない数式の区切り記号を、ただの文字として無害化する。
+ *
+ * 解説が長さの上限で切れると、末尾が「\( a = 」のように開いたままになる。
+ * このまま画面のKaTeXへ渡すと、開いた \( から次に現れる \) までが
+ * ひとつの数式として扱われ、あいだにある説明の段落がまるごと消える。
+ * 実際、コサイン類似度の解説で本文の冒頭が消え、「{v}\)」だけが残っていた。
+ *
+ * そこで、対になっていて、かつ空行をまたがない区切りだけを数式として残す。
+ * 数式が段落をまたぐことは無いので、空行を越えたら閉じ忘れとみなしてよい。
+ * 無害化するのは区切り記号だけで、中身の文字は消さない。
+ */
+function aiRepairMathDelimiters_(text) {
+  const source = String(text || '');
+  const CLOSER_OF = { '\\(': '\\)', '\\[': '\\]' };
+  const out = [];
+  let i = 0;
+
+  while (i < source.length) {
+    const token = source.substr(i, 2);
+    const closer = CLOSER_OF[token];
+
+    if (closer) {
+      const bodyStart = i + 2;
+      const closeAt = source.indexOf(closer, bodyStart);
+      const breakAt = source.slice(bodyStart).search(/\n[ \t]*\n/);
+      const paragraphEnd = breakAt === -1 ? -1 : bodyStart + breakAt;
+
+      const paired = closeAt !== -1 && (paragraphEnd === -1 || closeAt < paragraphEnd);
+      if (paired) {
+        out.push(source.slice(i, closeAt + 2));  // 中身ごとそのまま残す
+        i = closeAt + 2;
+      } else {
+        i += 2;  // 開いたままの記号は落とし、続きは文章として読ませる
+      }
+      continue;
+    }
+
+    // ここへ来る \) と \] は、対応する開始記号が無い迷子。
+    if (token === '\\)' || token === '\\]') {
+      i += 2;
+      continue;
+    }
+
+    out.push(source[i]);
+    i += 1;
+  }
+
+  return out.join('');
 }
 
 /**
@@ -908,10 +993,15 @@ function callGeminiGenerateContent_(model, apiKey, parts) {
 function aiPlainText_(text) {
   // 数式は記法の除去対象から外す。LaTeX には \(a^*+b^*\) のように
   // マークダウンと紛らわしい記号が入りうるため、先に退避しておく。
+  //
+  // 中身は「空行をまたがない」ものだけを数式とみなす。閉じ忘れや、
+  // 長さ上限で途中まで届いた \( があると、次に現れる \) まで段落をいくつも
+  // 飲み込み、そのあいだの説明文が数式に化けて画面から消えてしまう。
   const math = [];
-  const stashed = String(text || '').replace(
+  const stashed = aiRepairMathDelimiters_(text).replace(
     /\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)/g,
     matched => {
+      if (/\n[ \t]*\n/.test(matched)) return matched;
       math.push(matched);
       return '\u0000' + (math.length - 1) + '\u0000';
     }

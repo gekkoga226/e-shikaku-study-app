@@ -29,6 +29,9 @@ from gas_source import (  # noqa: E402
     strip_comments,
     strip_literals,
 )
+from js_runtime import collect, js_value, require_node, run  # noqa: E402
+
+CODE = read('Code.gs')
 
 # AI補助解説を構成するサーバー側の関数。
 AI_SERVER_FUNCTIONS = (
@@ -42,6 +45,7 @@ AI_SERVER_FUNCTIONS = (
     'aiCachePut_',
     'aiPick_',
     'aiFailure_',
+    'aiRepairMathDelimiters_',
 )
 
 # シートを書き換えるApps Script API。AI側では1つも使わない。
@@ -453,6 +457,112 @@ class TestClientCallsAiOnlyOnDemand(unittest.TestCase):
         for forbidden in ('submitAnswer(', 'renderResult(', 'loadNextQuestion('):
             self.assertNotIn(forbidden, body,
                              f'AI処理が {forbidden} を呼び出しています')
+
+
+class TestExplanationIsNotCutOff(unittest.TestCase):
+    """解説が途中で切れたまま黙って表示されないこと。"""
+
+    def test_token_budget_covers_the_requested_length(self):
+        """本文800〜1200文字＋思考ぶんに足りる上限であること。"""
+        limit = re.search(r'MAX_OUTPUT_TOKENS:\s*(\d+)', CODE)
+        self.assertIsNotNone(limit, 'MAX_OUTPUT_TOKENS が見つかりません')
+        self.assertGreaterEqual(
+            int(limit.group(1)), 4096,
+            '日本語1200文字とモデルの思考ぶんを合わせると足りず、解説が途中で切れます',
+        )
+
+    def test_truncation_is_detected_and_reported(self):
+        body = strip_comments(function_body(CODE, 'callGeminiGenerateContent_'))
+        self.assertIn('finishReason', body,
+                      '長さ上限で切れたかどうかを確認していません')
+        self.assertIn('MAX_TOKENS', body, 'MAX_TOKENS を判定していません')
+        self.assertIn('truncated', body, '切れたことを呼び出し元へ伝えていません')
+
+    def test_thought_parts_are_not_shown_as_the_explanation(self):
+        body = strip_comments(function_body(CODE, 'callGeminiGenerateContent_'))
+        self.assertRegex(body, r'thought\s*!==\s*true',
+                         'モデルの内部の思考を解説本文として表示しています')
+
+    def test_truncated_text_is_not_cached(self):
+        body = strip_comments(function_body(CODE, 'getAiExplanation'))
+        self.assertRegex(
+            body, r'truncated\s*!==\s*true[\s\S]{0,120}aiCachePut_',
+            '途中で切れた解説をキャッシュすると、1時間そのまま再表示されます',
+        )
+
+    def test_client_tells_the_reader_when_it_was_cut(self):
+        script = html_script('Client.html')
+        self.assertIn('res.truncated', script,
+                      '切れたことを画面に出していません')
+
+    def test_explanation_box_has_no_fixed_height(self):
+        styles = read('Styles.html')
+        rules = re.findall(
+            r'\.(?:ai-)?explanation-box[^{]*\{([^}]*)\}', styles
+        )
+        self.assertTrue(rules, '解説ボックスのCSSが見つかりません')
+        joined = ' '.join(rules)
+        self.assertNotRegex(
+            joined, r'(?<!max-)height:\s*(?!auto)\S',
+            '解説ボックスの高さを固定すると、長い解説が見切れます',
+        )
+        self.assertNotIn('overflow: hidden', joined,
+                         '解説ボックスがはみ出した文字を切り落としています')
+
+
+class TestMathDelimitersAreRepaired(unittest.TestCase):
+    """壊れた数式記号が、まわりの説明文を巻き込んで消さないこと。
+
+    実際に aiPlainText_ をNodeで動かして確かめる。
+    """
+
+    def setUp(self):
+        require_node(self)
+
+    def plain(self, text):
+        script = '\n'.join([
+            collect(CODE, ('aiRepairMathDelimiters_', 'aiPlainText_')),
+            'console.log(JSON.stringify({ out: aiPlainText_(%s) }));' % js_value(text),
+        ])
+        return run(script)['out']
+
+    def test_complete_math_is_left_alone(self):
+        text = 'ベクトル \\(\\mathbf{u}\\) のとき \\[ \\cos\\theta = \\frac{a}{b} \\] です。'
+        self.assertEqual(self.plain(text), text)
+
+    def test_unclosed_delimiter_at_the_end_keeps_its_text(self):
+        """長さ上限で切れた末尾の \\( が、読めない断片として残らないこと。"""
+        out = self.plain('ここで、分母 \\(\\|\\mathbf{u}\\|')
+        self.assertIn('ここで、分母', out, '手前の文章まで消えています')
+        self.assertNotIn('\\(', out, '開いたままの区切り記号が残っています')
+
+    def test_unclosed_delimiter_does_not_swallow_later_paragraphs(self):
+        """これが今回の不具合。閉じ忘れの \\( が段落をまとめて飲み込んでいた。"""
+        out = self.plain(
+            '最初の段落 \\( a = 1\n\n'
+            '二段落目の説明文はここにあります。\n\n'
+            '三段落目 \\(b\\) です。'
+        )
+        self.assertIn('二段落目の説明文はここにあります。', out,
+                      '数式の閉じ忘れが、あいだの説明文を消しています')
+        self.assertIn('\\(b\\)', out, '正しく閉じた数式まで壊しています')
+        # 開きと閉じの数が合っていないと、画面のKaTeXが手前の \\( から
+        # ここの \\) までを1つの数式とみなし、あいだの段落を飲み込む。
+        self.assertEqual(
+            out.count('\\('), out.count('\\)'),
+            '対になっていない区切り記号が残っており、KaTeXが説明文を飲み込みます',
+        )
+
+    def test_stray_closing_delimiter_is_removed(self):
+        """画面に「{v}\\)」のような断片が出ないこと。"""
+        out = self.plain('としたとき、コサイン類似度\\) を考えます。')
+        self.assertIn('コサイン類似度', out)
+        self.assertNotIn('\\)', out, '対応する開始記号の無い区切りが残っています')
+
+    def test_markdown_inside_math_survives(self):
+        out = self.plain('式は \\(a^*+b^*\\) です。**強調**は消える。')
+        self.assertIn('\\(a^*+b^*\\)', out, '数式の中の記号を消しています')
+        self.assertIn('強調は消える', out)
 
 
 class TestNoNewAppsScriptFiles(unittest.TestCase):
