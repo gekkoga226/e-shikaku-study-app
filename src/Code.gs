@@ -348,7 +348,13 @@ const AI_SYSTEM_INSTRUCTION = [
   '- 学習者は非エンジニアです。専門用語をいきなり使わず、まず日常のことばで言い換え、',
   '  そのあとに正式な用語を出してください。',
   '  例:「数字を縦横に並べた表」→「これを正式には行列（matrix）と呼びます」',
-  '- 数式は最小限にし、使うときは記号の意味を日本語で説明してください。',
+  '- 数式は、書いたほうが理解しやすいところでは使ってください。',
+  '  ただし式を置いただけで終わらせず、記号が何を指すのかを必ず日本語で説明してください。',
+  '- 数式はLaTeXで書き、文中に挟むときは \\( と \\) で、',
+  '  行を分けて見せるときは \\[ と \\] で囲んでください。',
+  '  ドル記号（$）は金額と紛らわしいので数式の区切りに使わないでください。',
+  '  例: 平均は \\( \\frac{1}{n}\\sum_{i=1}^{n} x_i \\) で求めます。ここで n はデータの個数です。',
+  '  数式を使わないほうが分かりやすい場面では、無理に使わなくて構いません。',
   '- 与えられた情報に書かれていないことは推測で断定せず、',
   '  「登録された解説にはここまでしか書かれていません」と正直に述べてください。',
   '- 画像が渡された場合は、その画像に実際に写っているものだけを根拠にしてください。',
@@ -674,7 +680,18 @@ function callGeminiGenerateContent_(model, apiKey, parts) {
  * AIへの指示だけに頼らず、ここでも取り除いておく。
  */
 function aiPlainText_(text) {
-  return String(text || '')
+  // 数式は記法の除去対象から外す。LaTeX には \(a^*+b^*\) のように
+  // マークダウンと紛らわしい記号が入りうるため、先に退避しておく。
+  const math = [];
+  const stashed = String(text || '').replace(
+    /\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)/g,
+    matched => {
+      math.push(matched);
+      return '\u0000' + (math.length - 1) + '\u0000';
+    }
+  );
+
+  const cleaned = stashed
     .split('\n')
     .map(line => {
       let out = line;
@@ -691,6 +708,9 @@ function aiPlainText_(text) {
     .join('\n')
     .replace(/\n\n\n+/g, '\n\n')
     .trim();
+
+  // 退避しておいた数式を元に戻す。
+  return cleaned.replace(/\u0000(\d+)\u0000/g, (whole, index) => math[Number(index)]);
 }
 
 function aiCacheGet_(key) {

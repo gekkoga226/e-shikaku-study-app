@@ -188,6 +188,61 @@ class TestApiKeyHandling(unittest.TestCase):
                             'APIキーをログへ出力しています')
 
 
+class TestMathRendering(unittest.TestCase):
+    """数式（LaTeX）の表示。"""
+
+    def test_instruction_asks_for_latex_delimiters(self):
+        code = read('Code.gs')
+        match = re.search(r'const AI_SYSTEM_INSTRUCTION = \[([\s\S]*?)\]\.join', code)
+        instruction = match.group(1)
+        self.assertIn('LaTeX', instruction, 'LaTeXで書く指示がありません')
+        self.assertIn(r'\\(', instruction, r'\( を区切りに使う指示がありません')
+        self.assertIn(r'\\[', instruction, r'\[ を区切りに使う指示がありません')
+        self.assertIn('記号が何を指すのか', instruction,
+                      '記号の意味を日本語で説明させる指示がありません')
+
+    def test_math_is_protected_from_markdown_stripping(self):
+        """\\(a^*+b^*\\) のような式が、記法の除去で壊されないこと。"""
+        body = function_body(read('Code.gs'), 'aiPlainText_')
+        self.assertRegex(
+            body,
+            r'math\.push\(',
+            '数式を退避してから記法を除去していません',
+        )
+        self.assertRegex(
+            body,
+            r'return cleaned\.replace\(',
+            '退避した数式を戻していません',
+        )
+
+    def test_client_renders_math_after_setting_text(self):
+        client = read('Client.html')
+        self.assertIn('renderMathIn(', client, '数式を組版する呼び出しがありません')
+        self.assertRegex(
+            client,
+            r'box\.textContent = res\.text[^\n]*\n\s*renderMathIn\(box\)',
+            'AI解説を入れたあとに数式を組版していません',
+        )
+        self.assertRegex(
+            client,
+            r"typeof renderMathInElement !== 'function'",
+            'KaTeXを読み込めなかった場合の分岐がありません',
+        )
+
+    def test_math_delimiters_avoid_dollar_sign(self):
+        """$ は金額と紛らわしいので数式の区切りに使わないこと。"""
+        client = read('Client.html')
+        match = re.search(r'delimiters:\s*\[([\s\S]*?)\]', client)
+        self.assertIsNotNone(match, 'KaTeXの区切り設定が見つかりません')
+        self.assertNotIn('$', match.group(1), '$ を数式の区切りに使っています')
+
+    def test_katex_is_pinned_and_optional(self):
+        index = read('Index.html')
+        self.assertRegex(index, r'katex@\d+\.\d+\.\d+',
+                         'KaTeXのバージョンを固定していません')
+        self.assertIn('defer', index, 'KaTeXの読み込みで表示を止めています')
+
+
 class TestGeminiCall(unittest.TestCase):
     """呼び出し方（サーバー側 / ヘッダー / モデル）。"""
 
