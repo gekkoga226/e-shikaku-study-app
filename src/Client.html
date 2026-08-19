@@ -376,9 +376,31 @@
     $('explanationBox').textContent = parts.length
       ? parts.join('\n\n')
       : '解説データは未登録です。正誤と理解度は正常に記録されています。';
+    renderMathIn($('explanationBox'));
 
     // 次の問題の選択時は、回答した直後の同じ問題を避ける。
     state.current = null;
+  }
+
+  /**
+   * \( ... \) と \[ ... \] を数式として組版する。
+   * KaTeXを読み込めなかった場合は何もしない（LaTeXは文字として残るが、
+   * 解説には記号の意味が日本語で書かれているので読み進められる）。
+   * $ は金額と紛らわしいので区切りに使わない。
+   */
+  function renderMathIn(el) {
+    if (!el || typeof renderMathInElement !== 'function') return;
+    try {
+      renderMathInElement(el, {
+        delimiters: [
+          { left: '\\[', right: '\\]', display: true },
+          { left: '\\(', right: '\\)', display: false }
+        ],
+        throwOnError: false
+      });
+    } catch (e) {
+      // 数式にできなくても、解説の文章はそのまま読める状態を保つ。
+    }
   }
 
   function resetAiExplanation() {
@@ -427,6 +449,7 @@
           (res.cached ? '（1時間以内に作成済みの結果を再表示）' : '');
         const box = $('aiExplanationBox');
         box.textContent = res.text || '';
+        renderMathIn(box);
         box.classList.remove('hidden');
         btn.textContent = 'AI解説をもう一度作る';
       })

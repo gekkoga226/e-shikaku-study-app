@@ -4,6 +4,16 @@
   <base target="_top">
   <meta charset="utf-8">
   <?!= include('Styles'); ?>
+
+  <!--
+    数式表示（KaTeX）。解説に \( ... \) や \[ ... \] が含まれるときだけ働く。
+    読み込みに失敗しても解説そのものは文字として読めるので、アプリは止めない。
+    バージョンは固定する（勝手に上がって表示が変わらないようにするため）。
+  -->
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
 </head>
 <body>
   <header class="app-header">
