@@ -353,13 +353,26 @@ const AI_SYSTEM_INSTRUCTION = [
   '  「登録された解説にはここまでしか書かれていません」と正直に述べてください。',
   '- 画像が渡された場合は、その画像に実際に写っているものだけを根拠にしてください。',
   '',
+  '書き方（表示側はプレーンテキストなので、記法はそのまま文字として出てしまいます）:',
+  '- マークダウン記法を使わないでください。',
+  '  アスタリスク（*）による強調や箇条書き、シャープ（#）の見出し、',
+  '  ハイフンだけの区切り線（---）、バッククォートは一切使わないでください。',
+  '- 箇条書きは行頭に「・」を置いてください。',
+  '- 強調したいときも装飾記号は使わず、ことばの選び方と語順で伝えてください。',
+  '',
+  'ふるまい:',
+  '- 褒めたり励ましたりしないでください。',
+  '  「おめでとうございます」「素晴らしいです」のような評価のことばは書かないでください。',
+  '- 正解・不正解や自信度そのものに言及せず、内容の説明だけを淡々と書いてください。',
+  '- 前置きや自己紹介は書かず、いきなり本題から始めてください。',
+  '',
   '出力の構成（この見出しをそのまま使い、この順番で書く）:',
   '【まず一言】',
   '【なぜそうなる？】',
   '【他の選択肢との違い】',
   '【覚え方】',
   '',
-  '全体で日本語800〜1200文字程度。箇条書きを適度に使い、読みやすくしてください。'
+  '全体で日本語800〜1200文字程度。読みやすい長さの文で書いてください。'
 ].join('\n');
 
 /**
@@ -648,12 +661,36 @@ function callGeminiGenerateContent_(model, apiKey, parts) {
 
   const candidates = data.candidates || [];
   const content = candidates.length ? (candidates[0].content || {}) : {};
-  const text = (content.parts || []).map(p => String(p.text || '')).join('').trim();
-  if (!text) {
+  const raw = (content.parts || []).map(p => String(p.text || '')).join('').trim();
+  if (!raw) {
     return aiFailure_('AI_EMPTY_RESPONSE', 'AIから補助解説が返りませんでした。もう一度お試しください。');
   }
 
-  return { ok: true, text: text };
+  return { ok: true, text: aiPlainText_(raw) };
+}
+
+/**
+ * 画面はプレーンテキストで表示するため、マークダウン記法は文字として見えてしまう。
+ * AIへの指示だけに頼らず、ここでも取り除いておく。
+ */
+function aiPlainText_(text) {
+  return String(text || '')
+    .split('\n')
+    .map(line => {
+      let out = line;
+      out = out.replace(/^\s*#+\s+/, '');                      // 見出し
+      out = out.replace(/^(\s*)[*+-]\s+/, '$1・');              // 箇条書き
+      out = out.replace(/^\s*([*_-])(\s*\1)(\s*\1)+\s*$/, ''); // 区切り線
+      out = out.replace(/\*\*([^*]+)\*\*/g, '$1');             // 太字
+      // 斜体。前後に空白を挟むもの（掛け算の 2 * 3 など）は記法ではないので残す。
+      out = out.replace(/(^|[^*])\*(\S([^*\n]*\S)?)\*/g, '$1$2');
+      // コード（\u0060 はバッククォート。文字そのものは書かない）。
+      out = out.replace(/\u0060([^\u0060\n]+)\u0060/g, '$1');
+      return out;
+    })
+    .join('\n')
+    .replace(/\n\n\n+/g, '\n\n')
+    .trim();
 }
 
 function aiCacheGet_(key) {
