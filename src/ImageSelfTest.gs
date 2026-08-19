@@ -45,6 +45,61 @@ function runImageSupportSelfTest() {
 }
 
 /**
+ * 画像4択（A〜Dそのものが画像）の対応を確認する非破壊テスト。
+ *
+ * 見るのは ImageManifest.gs の o（選択肢ごとの画像index）だけで、
+ * 「並び順から推測」はしません。A/B/C/D がそれぞれ別の画像を、
+ * 重複なく指していることを確認します。
+ * 04_学習ログへは書きません。
+ */
+function runImageOptionMappingSelfTest() {
+  const samples = [
+    'EXAM-A1-Q004', 'EXAM-A1-Q010',
+    'EXAM-A2-Q005', 'EXAM-A2-Q010',
+    'EXAM-A4-Q006', 'EXAM-A4-Q008',
+    'EXAM-B2-Q043', 'EXAM-B3-Q003'
+  ];
+
+  const results = samples.map(qid => {
+    const manifest = IMAGE_ROLE_MAP_BY_QUESTION_ID[qid];
+    if (!manifest || !manifest.o) {
+      return { question_id: qid, ok: false, detail: 'manifest missing' };
+    }
+
+    const letters = ['A', 'B', 'C', 'D'];
+    const used = {};
+    let ok = true;
+    const mapping = {};
+
+    letters.forEach(letter => {
+      const indexes = manifest.o[letter];
+      if (!indexes || indexes.length !== 1) {
+        ok = false;
+        mapping[letter] = 'missing';
+        return;
+      }
+      const index = Number(indexes[0]);
+      mapping[letter] = index;
+      if (used[index]) ok = false; // 同じ画像が2つの選択肢へ割り当てられている
+      used[index] = true;
+    });
+
+    const questionIndexes = (manifest.q || []).map(Number);
+    questionIndexes.forEach(index => {
+      if (used[index]) ok = false; // 問題画像と選択肢画像の取り違え
+    });
+
+    return { question_id: qid, ok: ok, detail: JSON.stringify(mapping) };
+  });
+
+  return {
+    ok: results.every(r => r.ok),
+    results,
+    note: 'ImageManifestのA〜D対応だけを確認します。04_学習ログには書きません。'
+  };
+}
+
+/**
  * Drive権限と実画像展開のスモークテスト。
  * 学習ログには書きません。
  */

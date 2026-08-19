@@ -20,6 +20,8 @@ const APP_CONFIG = Object.freeze({
     LOG: '04_学習ログ',
     DASHBOARD: '06_ダッシュボード'
   },
+  // learning / review は従来どおり。unanswered は未回答だけを消化する独立モード。
+  MODES: ['learning', 'review', 'unanswered'],
   MAX_CLIENT_EXCLUDES: 30
 });
 
@@ -38,6 +40,7 @@ function getInitialData() {
   return {
     dashboard: readDashboard_(),
     weaknesses: readWeaknesses_(8),
+    unanswered: readUnansweredSummary_(),
     ruleVersion: readSettingValue_('mastery_rule_version') || '',
     generatedAt: formatDateTime_(new Date())
   };
@@ -50,17 +53,24 @@ function getWeaknessData() {
 /**
  * request:
  * {
- *   mode: "learning" | "review",
+ *   mode: "learning" | "review" | "unanswered",
  *   excludeQuestionIds: ["..."]
  * }
  */
 function getNextQuestion(request) {
   request = request || {};
-  const mode = request.mode === 'review' ? 'review' : 'learning';
+  const mode = normalizeMode_(request.mode);
   const excludes = new Set((request.excludeQuestionIds || []).slice(-APP_CONFIG.MAX_CLIENT_EXCLUDES));
 
-  const questions = readObjects_(APP_CONFIG.SHEETS.QUESTIONS)
-    .filter(isFormalQuestion_)
+  const formal = readObjects_(APP_CONFIG.SHEETS.QUESTIONS).filter(isFormalQuestion_);
+  const logs = readObjects_(APP_CONFIG.SHEETS.LOG);
+
+  // 未回答モードは独立した出題経路。既存のPhase8優先ロジックには入らない。
+  if (mode === 'unanswered') {
+    return nextUnansweredQuestion_(formal, logs, excludes);
+  }
+
+  const questions = formal
     .filter(q => !excludes.has(String(q.question_id)))
     .filter(q => imageSupportAllowsQuestionObject_(q));
 
@@ -68,7 +78,6 @@ function getNextQuestion(request) {
     return { ok: false, reason: 'NO_ELIGIBLE_QUESTION' };
   }
 
-  const logs = readObjects_(APP_CONFIG.SHEETS.LOG);
   const latest = latestFormalLogByQuestion_(logs);
   const nodes = readMindmapLeafNodes_();
   const today = startOfDay_(new Date());
@@ -131,13 +140,135 @@ function getNextQuestion(request) {
   return publicQuestion_(fallback, node, mode);
 }
 
+/* --------------------------- 未回答問題優先モード ---------------------------
+ *
+ * 未回答の定義（この1か所だけで決める）:
+ *   03_問題台帳で verification_status=verified かつ active=TRUE の正式問題のうち、
+ *   04_学習ログで counts_for_mastery=TRUE となる行を question_id 単位で1件も持たないもの。
+ *
+ * counts_for_mastery は04_学習ログU列のシート数式そのもの。
+ * provisional / inactive / system_test / write失敗 / mastery tracking開始前 は
+ * その数式が既に FALSE にしているため、ここで独自の除外条件を作らない。
+ *
+ * このモードは理解度の計算方法を一切変えない。出題順を変えるだけ。
+ */
+
+/**
+ * 未回答モードの出題。回答済み問題は1問も混ぜない。
+ */
+function nextUnansweredQuestion_(formalQuestions, logs, excludes) {
+  const answered = answeredQuestionIdSet_(logs);
+  const unanswered = formalQuestions.filter(q => !answered.has(String(q.question_id)));
+
+  if (!unanswered.length) {
+    // 回答済み問題へは絶対にフォールバックしない。
+    return {
+      ok: false,
+      reason: 'ALL_QUESTIONS_ANSWERED',
+      mode: 'unanswered',
+      remaining_unanswered: 0,
+      message: '未回答の正式問題はすべて解答済みです。'
+    };
+  }
+
+  const candidates = unanswered
+    .filter(q => !excludes.has(String(q.question_id)))
+    .filter(q => imageSupportAllowsQuestionObject_(q));
+
+  if (!candidates.length) {
+    // 未回答は残っているが、いまは表示できない（画像取得に失敗した直後など）。
+    // ここでも回答済み問題へは戻らない。
+    return {
+      ok: false,
+      reason: 'NO_ELIGIBLE_UNANSWERED_QUESTION',
+      mode: 'unanswered',
+      remaining_unanswered: unanswered.length,
+      message: 'いま表示できる未回答問題がありません。少し時間をおいてからお試しください。'
+    };
+  }
+
+  const nodeById = {};
+  readMindmapLeafNodes_().forEach(node => { nodeById[node.node_id] = node; });
+
+  const picked = candidates.slice().sort((a, b) => compareUnansweredCandidates_(a, b, nodeById))[0];
+  const node = nodeById[String(picked.primary_node_id || '')] || null;
+
+  const payload = publicQuestion_(picked, node, 'unanswered');
+  payload.remaining_unanswered = unanswered.length;
+  return payload;
+}
+
+/**
+ * 未回答候補どうしの優先順位。
+ * 1. coverage（primary_unique_answered_count / required_unique_questions）が不足している論点
+ * 2. 不足量が大きい論点
+ * 3. 理解度が低い論点
+ * 4. question_id（同点でも毎回同じ順番になるようにする）
+ */
+function compareUnansweredCandidates_(a, b, nodeById) {
+  const nodeA = nodeById[String(a.primary_node_id || '')] || null;
+  const nodeB = nodeById[String(b.primary_node_id || '')] || null;
+
+  const shortA = coverageShortage_(nodeA);
+  const shortB = coverageShortage_(nodeB);
+  if ((shortA > 0) !== (shortB > 0)) return shortA > 0 ? -1 : 1;
+  if (shortA !== shortB) return shortB - shortA;
+
+  const masteryA = nodeA ? nodeA.mastery_pct : 0;
+  const masteryB = nodeB ? nodeB.mastery_pct : 0;
+  if (masteryA !== masteryB) return masteryA - masteryB;
+
+  return String(a.question_id).localeCompare(String(b.question_id));
+}
+
+/** required_unique_questions にあと何問足りないか（シートの値をそのまま使う）。 */
+function coverageShortage_(node) {
+  if (!node) return 0;
+  const required = numberOrZero_(node.required_unique_questions);
+  if (required <= 0) return 0;
+  return Math.max(0, required - numberOrZero_(node.primary_unique_answered_count));
+}
+
+/**
+ * counts_for_mastery=TRUE の行を1件でも持つ question_id の集合。
+ * 判定根拠は04_学習ログU列の数式だけ。
+ */
+function answeredQuestionIdSet_(logs) {
+  const answered = new Set();
+  (logs || []).forEach(row => {
+    if (!truthy_(row.counts_for_mastery)) return;
+    const qid = String(row.question_id || '');
+    if (qid) answered.add(qid);
+  });
+  return answered;
+}
+
+/** ホーム画面の「未回答問題を優先して解く（N問）」に出す残数。 */
+function readUnansweredSummary_() {
+  const formal = readObjects_(APP_CONFIG.SHEETS.QUESTIONS).filter(isFormalQuestion_);
+  const answered = answeredQuestionIdSet_(readObjects_(APP_CONFIG.SHEETS.LOG));
+  const remaining = formal.filter(q => !answered.has(String(q.question_id))).length;
+  return {
+    formal_total: formal.length,
+    answered_unique: formal.length - remaining,
+    remaining: remaining
+  };
+}
+
+function normalizeMode_(mode) {
+  const value = String(mode || '').trim();
+  return APP_CONFIG.MODES.indexOf(value) >= 0 ? value : 'learning';
+}
+
 function submitAnswer(payload) {
   payload = payload || {};
   const qid = String(payload.questionId || '').trim();
   const userAnswer = String(payload.userAnswer || '').trim().toUpperCase();
   const confidence = Number(payload.confidence || 0);
   const responseSeconds = payload.responseSeconds == null ? '' : Number(payload.responseSeconds);
-  const mode = payload.mode === 'review' ? 'review' : 'learning';
+  // 未回答モードで解いた回答も、通常の正式回答条件を満たせば理解度へ反映される。
+  // （U列の数式が除外するのは mode="system_test" だけ）
+  const mode = normalizeMode_(payload.mode);
   const sessionId = String(payload.sessionId || makeSessionId_());
 
   if (!qid) throw new Error('questionId がありません。');
@@ -299,6 +430,14 @@ function runSelfTest() {
 
     const eligibleCount = readObjects_(APP_CONFIG.SHEETS.QUESTIONS).filter(isFormalQuestion_).length;
     push('Formal questions > 0', eligibleCount > 0, eligibleCount);
+
+    // 未回答モードの残数（読むだけ。ログには書かない）。
+    const unanswered = readUnansweredSummary_();
+    push(
+      'Unanswered summary',
+      unanswered.formal_total === eligibleCount && unanswered.remaining <= unanswered.formal_total,
+      unanswered.remaining + ' / ' + unanswered.formal_total
+    );
 
     return {
       ok: results.every(r => r.ok),

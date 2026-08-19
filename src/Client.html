@@ -10,7 +10,8 @@
     presentSeq: 0,
     failedQuestions: new Set(),
     attemptId: '',
-    aiSeq: 0
+    aiSeq: 0,
+    lightboxZoomed: false
   };
 
   const $ = id => document.getElementById(id);
@@ -18,12 +19,15 @@
   document.addEventListener('DOMContentLoaded', () => {
     $('startBtn').addEventListener('click', () => startLearning('learning'));
     $('reviewBtn').addEventListener('click', () => startLearning('review'));
+    $('unansweredBtn').addEventListener('click', () => startLearning('unanswered'));
     $('homeBtn').addEventListener('click', showHome);
     $('resultHomeBtn').addEventListener('click', showHome);
+    $('noticeHomeBtn').addEventListener('click', showHome);
     $('nextBtn').addEventListener('click', loadNextQuestion);
     $('submitBtn').addEventListener('click', submitCurrentAnswer);
     $('aiExplainBtn').addEventListener('click', requestAiExplanation);
     $('lightboxClose').addEventListener('click', closeLightbox);
+    $('lightboxZoomBtn').addEventListener('click', toggleLightboxZoom);
     $('lightbox').addEventListener('click', e => { if (e.target === $('lightbox')) closeLightbox(); });
     document.addEventListener('change', updateSubmitState);
     loadHomeData();
@@ -37,9 +41,24 @@
           : '理解度基準をシートから読み込み';
         renderDashboard(data.dashboard || []);
         renderWeaknesses(data.weaknesses || []);
+        renderUnansweredButton(data.unanswered);
       })
       .withFailureHandler(showServerError)
       .getInitialData();
+  }
+
+  // 残数はサーバー（＝04_学習ログのcounts_for_mastery）が数えた値をそのまま出す。
+  function renderUnansweredButton(summary) {
+    const btn = $('unansweredBtn');
+    const remaining = summary ? Number(summary.remaining) : NaN;
+
+    if (!Number.isFinite(remaining)) {
+      btn.textContent = '未回答問題を優先して解く';
+      return;
+    }
+    btn.textContent = remaining > 0
+      ? '未回答問題を優先して解く（' + remaining + '問）'
+      : '未回答問題を優先して解く（すべて解答済み）';
   }
 
   function renderDashboard(items) {
@@ -86,8 +105,10 @@
     });
   }
 
+  const MODES = ['learning', 'review', 'unanswered'];
+
   function startLearning(mode) {
-    state.mode = mode === 'review' ? 'review' : 'learning';
+    state.mode = MODES.indexOf(mode) >= 0 ? mode : 'learning';
     state.excludeQuestionIds = [];
     state.failedQuestions.clear();
     showQuestionView();
@@ -107,10 +128,22 @@
   }
 
   function setQuestionLoading(message) {
+    showQuestionPanel(true, '問題を準備しています', message || '安全に表示できるか確認中です。');
+  }
+
+  // 待っていても状況が変わらないとき（未回答が0件など）に出す固定メッセージ。
+  function showQuestionNotice(title, message) {
+    showQuestionPanel(false, title, message);
+  }
+
+  function showQuestionPanel(busy, title, message) {
     $('questionCard').classList.add('hidden');
     $('resultCard').classList.add('hidden');
     $('questionLoading').classList.remove('hidden');
-    $('loadingMessage').textContent = message || '安全に表示できるか確認中です。';
+    $('loadingSpinner').classList.toggle('hidden', !busy);
+    $('noticeHomeBtn').classList.toggle('hidden', busy);
+    $('loadingTitle').textContent = title;
+    $('loadingMessage').textContent = message;
   }
 
   function loadNextQuestion() {
@@ -125,7 +158,18 @@
       .withSuccessHandler(q => {
         if (seq !== state.presentSeq) return;
         if (!q || !q.ok) {
-          setQuestionLoading('現在の条件で出せる問題がありません。');
+          // 未回答モードで残り0件のときは、回答済み問題へ勝手に戻さない。
+          if (q && q.reason === 'ALL_QUESTIONS_ANSWERED') {
+            showQuestionNotice(
+              '未回答の正式問題はすべて解答済みです',
+              q.message || '弱点モードや復習モードで、解いた問題の定着を確認できます。'
+            );
+            return;
+          }
+          showQuestionNotice(
+            'いま出せる問題がありません',
+            (q && q.message) || '現在の条件に合う問題が見つかりませんでした。'
+          );
           showToast('出題できる問題が見つかりませんでした。');
           return;
         }
@@ -217,7 +261,7 @@
     $('questionText').textContent = q.question_text || '';
 
     renderQuestionImages(q, bundle.question_images || []);
-    renderOptions(q, bundle.option_images || []);
+    renderOptions(q, bundle.option_images || {});
 
     document.querySelectorAll('input[name="confidence"]').forEach(x => { x.checked = false; });
     $('submitBtn').disabled = true;
@@ -231,17 +275,46 @@
       img.className = 'question-image';
       img.alt = '問題画像 ' + (idx + 1);
       img.src = x.data_url;
-      img.addEventListener('click', () => openLightbox(x.data_url));
+      img.addEventListener('click', () => openLightbox(x.data_url, '問題画像 ' + (idx + 1)));
       img.addEventListener('error', () => rejectRenderedImage(q, 'QUESTION_IMAGE_RENDER_ERROR'));
       area.appendChild(img);
     });
+  }
+
+  /*
+    03_問題台帳には「[Aの画像選択肢]」のような内部用の目印が入っている行がある。
+    これは画面へ出す文章ではないので、その選択肢の画像が実際に表示できたときだけ隠す。
+    画像が無いのに文字だけ隠すと「何を選ぶのか分からないまま回答できる」状態になるため、
+    その場合は隠さず、問題ごとスキップする。
+  */
+  const OPTION_IMAGE_PLACEHOLDER =
+    /^[\[［(（]?\s*(?:選択肢)?\s*[A-Ha-h]?\s*の?\s*(?:画像選択肢|選択肢画像|画像)\s*[A-Ha-h]?\s*[\]］)）]?$/;
+
+  function isOptionImagePlaceholder(text) {
+    const value = String(text == null ? '' : text).trim();
+    if (!value) return false;
+    return OPTION_IMAGE_PLACEHOLDER.test(value);
   }
 
   function renderOptions(q, optionImages) {
     const area = $('optionsArea');
     area.innerHTML = '';
 
-    Object.keys(q.options || {}).sort().forEach(letter => {
+    const letters = Object.keys(q.options || {}).sort();
+
+    for (const letter of letters) {
+      // 選択肢画像は、必ずその文字（A/B/C/D）をキーにして取り出す。
+      // 表示順から推測しないことで、A画像がBへ付くような取り違えを防ぐ。
+      const imgs = optionImages[letter] || [];
+      const rawText = q.options[letter] || '';
+      const placeholder = isOptionImagePlaceholder(rawText);
+
+      if (placeholder && !imgs.length) {
+        // 画像前提の選択肢なのに画像が無い。回答させずにこの問題を止める。
+        rejectRenderedImage(q, 'OPTION_IMAGE_MISSING:' + letter);
+        return;
+      }
+
       const row = document.createElement('div');
       row.className = 'option-row';
 
@@ -259,16 +332,16 @@
 
       const text = document.createElement('span');
       text.className = 'option-text';
-      text.textContent = q.options[letter] || '';
+      text.textContent = placeholder ? '' : rawText;
       body.appendChild(text);
 
-      const imgs = optionImages[letter] || [];
       imgs.forEach((x, idx) => {
         const img = document.createElement('img');
         img.className = 'option-image';
         img.alt = '選択肢 ' + letter + ' の画像 ' + (idx + 1);
         img.src = x.data_url;
         img.addEventListener('error', () => rejectRenderedImage(q, 'OPTION_IMAGE_RENDER_ERROR:' + letter));
+        // 画像はボタンの中にあるので、画像をタップしてもこの選択肢が選ばれる。
         body.appendChild(img);
       });
 
@@ -277,17 +350,22 @@
       row.appendChild(button);
 
       if (imgs.length) {
+        // 拡大はボタンの外に置く。拡大しただけでA/B/C/Dが選ばれてはいけない。
         const zoom = document.createElement('button');
         zoom.type = 'button';
         zoom.className = 'zoom-btn';
         zoom.textContent = '拡大';
-        zoom.setAttribute('aria-label', '選択肢 ' + letter + ' の画像を拡大');
-        zoom.addEventListener('click', () => openLightbox(imgs[0].data_url));
+        zoom.setAttribute('aria-label', '選択肢 ' + letter + ' の画像を拡大（回答は選ばれません）');
+        zoom.addEventListener('click', e => {
+          e.stopPropagation();
+          e.preventDefault();
+          openLightbox(imgs[0].data_url, '選択肢 ' + letter + ' の画像');
+        });
         row.appendChild(zoom);
       }
 
       area.appendChild(row);
-    });
+    }
   }
 
   function rejectRenderedImage(q, reason) {
@@ -471,14 +549,39 @@
     }
   }
 
-  function openLightbox(src) {
-    $('lightboxImage').src = src;
+  function openLightbox(src, label) {
+    const img = $('lightboxImage');
+    img.src = src;
+    img.alt = label || '拡大画像';
     $('lightbox').classList.remove('hidden');
+    // 開いた直後は必ず「全体が見える」状態から始める。
+    setLightboxZoom(false);
   }
 
   function closeLightbox() {
+    setLightboxZoom(false);
     $('lightbox').classList.add('hidden');
     $('lightboxImage').removeAttribute('src');
+  }
+
+  function toggleLightboxZoom() {
+    setLightboxZoom(!state.lightboxZoomed);
+  }
+
+  /**
+   * false: 画面内へ縮小して画像全体を見せる（既定）
+   * true : 原寸のまま表示し、はみ出す分はスクロールで確認する
+   * どちらの場合も画像を切り落とさない。
+   */
+  function setLightboxZoom(zoomed) {
+    state.lightboxZoomed = !!zoomed;
+    const box = $('lightbox');
+    box.classList.toggle('zoomed', state.lightboxZoomed);
+    $('lightboxZoomBtn').textContent = state.lightboxZoomed ? '全体を表示' : '原寸で見る';
+    if (!state.lightboxZoomed) {
+      box.scrollTop = 0;
+      box.scrollLeft = 0;
+    }
   }
 
   function showToast(message) {
