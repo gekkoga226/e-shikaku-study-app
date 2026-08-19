@@ -195,7 +195,6 @@ button { touch-action: manipulation; }
   background: #f8fafc; border: 1px solid var(--line);
 }
 .mastery-change { font-weight: 900; font-size: 18px; }
-.explanation-box { white-space: pre-wrap; }
 .result-actions { display: grid; gap: 10px; margin-top: 18px; }
 .toast {
   position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%);
@@ -257,8 +256,16 @@ button { touch-action: manipulation; }
 .ai-title { margin: 0; font-size: 16px; }
 .ai-note { margin: 6px 0 12px; font-size: 13px; color: var(--muted); }
 .ai-status { margin: 10px 0 0; font-size: 13px; }
+/*
+  解説は長さが決まらない。高さを固定すると必ずどこかで見切れるので、
+  高さは中身に任せ、横に長い語（URLや長いLaTeXの残骸）だけを折り返す。
+*/
+.ai-explanation-box, .explanation-box {
+  white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal;
+  max-height: none; overflow: visible;
+}
 .ai-explanation-box {
-  white-space: pre-wrap; margin-top: 10px; padding: 14px;
+  margin-top: 10px; padding: 14px;
   background: #fff; border: 1px solid var(--line); border-radius: 12px;
 }
 

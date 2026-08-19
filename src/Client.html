@@ -545,7 +545,10 @@
         }
 
         status.textContent = 'モデル: ' + (res.model || '') +
-          (res.cached ? '（1時間以内に作成済みの結果を再表示）' : '');
+          (res.cached ? '（1時間以内に作成済みの結果を再表示）' : '') +
+          (res.truncated
+            ? '　※解説が長くなりすぎて途中で切れています。「AI解説をもう一度作る」でやり直せます。'
+            : '');
         const box = $('aiExplanationBox');
         box.textContent = res.text || '';
         renderMathIn(box);
