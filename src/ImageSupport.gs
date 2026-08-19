@@ -46,8 +46,8 @@ function getQuestionImageBundle(questionId) {
   if (!qid) return { ok: false, error_code: 'MISSING_QUESTION_ID' };
 
   try {
-    const ss = SpreadsheetApp.openById(APP_CONFIG.SPREADSHEET_ID);
-    const qSheet = ss.getSheetByName(APP_CONFIG.SHEETS.QUESTIONS);
+    // 読み取り経路と同じハンドルを使う（1回の実行でスプレッドシートを開くのは1度だけ）。
+    const qSheet = spreadsheet_().getSheetByName(APP_CONFIG.SHEETS.QUESTIONS);
     const q = findObjectById_(qSheet, 'question_id', qid);
 
     if (!q || !isFormalQuestion_(q)) throw new Error('QUESTION_NOT_FORMAL');
