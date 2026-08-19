@@ -14,7 +14,11 @@
     lightboxZoomed: false,
     // 結果を読んでいるあいだに用意しておく次の1問（読み取りだけ・書き込みはしない）
     prefetch: null,
-    prefetchKey: ''
+    prefetchKey: '',
+    // ジャンル別画面。表示するだけで、出題・採点・理解度には一切関わらない。
+    genre: null,
+    genreMistakes: null,
+    genreOpen: new Set()
   };
 
   const $ = id => document.getElementById(id);
@@ -23,6 +27,9 @@
     $('startBtn').addEventListener('click', () => startLearning('learning'));
     $('reviewBtn').addEventListener('click', () => startLearning('review'));
     $('unansweredBtn').addEventListener('click', () => startLearning('unanswered'));
+    $('genreBtn').addEventListener('click', showGenreView);
+    $('genreHomeBtn').addEventListener('click', showHome);
+    $('genreMistakeBtn').addEventListener('click', loadGenreMistakes);
     $('homeBtn').addEventListener('click', showHome);
     $('resultHomeBtn').addEventListener('click', showHome);
     $('noticeHomeBtn').addEventListener('click', showHome);
@@ -174,6 +181,232 @@
     });
   }
 
+  /* ---------------------- ジャンル別の弱点（表示だけ） ----------------------
+   *
+   * 学習モードではないので MODES へは足さない。
+   * getGenreBreakdown() は02_マインドマップだけを読む（getWeaknessData と同じ範囲）。
+   * 「これまでに間違えた数」は押されたときだけ getGenreMistakeHistory() を呼ぶ。
+   */
+  function showGenreView() {
+    clearPrefetch();
+    state.current = null;
+    $('homeView').classList.add('hidden');
+    $('questionView').classList.add('hidden');
+    $('genreView').classList.remove('hidden');
+    loadGenreBreakdown();
+  }
+
+  /*
+   * 1問解いたら、画面が持っているジャンル別の集計は古くなる。
+   * 「これまでに間違えた数」はボタンを押して読み込むものなので、
+   * ボタンの見た目も押す前の状態へ戻す。
+   */
+  function forgetGenreData() {
+    state.genre = null;
+    state.genreMistakes = null;
+    const btn = $('genreMistakeBtn');
+    btn.disabled = false;
+    btn.classList.remove('hidden');
+    btn.textContent = 'これまでに間違えた問題数も見る';
+    $('genreMistakeNote').textContent =
+      '帯グラフの「誤答」は、理解度と同じく最新の正式回答が不正解の問題数です。'
+      + '一度間違えたあと復習で正解にできた問題は含みません。';
+  }
+
+  function loadGenreBreakdown() {
+    const waiting = startWaitingNotice('genreHint', 'ジャンル別に集計中...');
+
+    google.script.run
+      .withSuccessHandler(data => {
+        waiting.stop();
+        state.genre = data || null;
+        $('genreHint').textContent = data && data.totals
+          ? '正答率が低い順（' + data.totals.topic_count + '論点）'
+          : '正答率が低い順';
+        renderGenreBreakdown();
+      })
+      .withFailureHandler(err => {
+        waiting.stop();
+        $('genreHint').textContent = '読み込めませんでした';
+        showToast(err && err.message ? err.message : String(err || '不明なエラー'));
+      })
+      .getGenreBreakdown();
+  }
+
+  // 押されたときだけ04_学習ログを読む。初回表示を待たせないため。
+  function loadGenreMistakes() {
+    const btn = $('genreMistakeBtn');
+    btn.disabled = true;
+    btn.textContent = '学習ログを読んでいます...';
+
+    google.script.run
+      .withSuccessHandler(data => {
+        state.genreMistakes = data || null;
+        btn.classList.add('hidden');
+        $('genreMistakeNote').innerHTML =
+          '「これまでに間違えた」は、正式な回答で一度でも不正解になった問題の数です'
+          + '（同じ問題を何度間違えても1問）。復習で正解にできた問題も含むため、'
+          + '帯グラフの「誤答」より多くなります。';
+        renderGenreBreakdown();
+      })
+      .withFailureHandler(err => {
+        btn.disabled = false;
+        btn.textContent = 'これまでに間違えた問題数も見る';
+        showToast(err && err.message ? err.message : String(err || '不明なエラー'));
+      })
+      .getGenreMistakeHistory();
+  }
+
+  function renderGenreBreakdown() {
+    const data = state.genre;
+    const list = $('genreList');
+    const totals = $('genreTotals');
+    list.innerHTML = '';
+    totals.innerHTML = '';
+    if (!data || !Array.isArray(data.genres)) return;
+
+    if (data.totals) {
+      appendMetric(totals, '総問題数', String(data.totals.total) + '問');
+      appendMetric(totals, '回答済み', data.totals.answered + '問（' + data.totals.answered_pct + '%）');
+      appendMetric(totals, '未回答', data.totals.unanswered + '問');
+      appendMetric(totals, '正答率', data.totals.correct_pct + '%');
+    }
+
+    data.genres.forEach(genre => list.appendChild(genreCard(genre)));
+  }
+
+  function appendMetric(parent, label, value) {
+    const div = document.createElement('div');
+    div.className = 'metric';
+    const l = document.createElement('div');
+    l.className = 'metric-label';
+    l.textContent = label;
+    const v = document.createElement('div');
+    v.className = 'metric-value';
+    v.textContent = value;
+    div.append(l, v);
+    parent.appendChild(div);
+  }
+
+  function genreCard(genre) {
+    const card = document.createElement('div');
+    card.className = 'genre-card';
+
+    const head = document.createElement('div');
+    head.className = 'genre-head';
+    const name = document.createElement('div');
+    name.className = 'genre-name';
+    name.textContent = genre.major_area;
+    const rates = document.createElement('div');
+    rates.className = 'genre-rates';
+    rates.textContent = '回答率 ' + genre.answered_pct + '% ／ 正答率 ' + genre.correct_pct + '%';
+    head.append(name, rates);
+
+    card.append(head, genreBar(genre), genreNumbers(genre));
+
+    const mistakes = genreEverWrong(genre);
+    if (mistakes !== null) {
+      const line = document.createElement('div');
+      line.className = 'genre-numbers genre-mistakes';
+      line.textContent = 'これまでに間違えた問題: ' + mistakes + '問';
+      card.appendChild(line);
+    }
+
+    if (genre.topics && genre.topics.length) {
+      const toggle = document.createElement('button');
+      toggle.className = 'genre-toggle';
+      toggle.type = 'button';
+      const topics = document.createElement('div');
+      topics.className = 'genre-topics';
+
+      const paint = () => {
+        const open = state.genreOpen.has(genre.major_area);
+        toggle.textContent = (open ? '▲ 論点を隠す（' : '▼ 論点ごとに見る（') + genre.topics.length + '件）';
+        topics.classList.toggle('hidden', !open);
+      };
+      toggle.addEventListener('click', () => {
+        if (state.genreOpen.has(genre.major_area)) state.genreOpen.delete(genre.major_area);
+        else state.genreOpen.add(genre.major_area);
+        paint();
+      });
+
+      genre.topics.forEach(topic => topics.appendChild(genreTopicRow(topic)));
+      paint();
+      card.append(toggle, topics);
+    }
+
+    return card;
+  }
+
+  function genreTopicRow(topic) {
+    const row = document.createElement('div');
+    row.className = 'genre-topic';
+
+    const head = document.createElement('div');
+    head.className = 'genre-head';
+    const name = document.createElement('div');
+    name.className = 'genre-topic-name';
+    name.textContent = topic.topic || topic.node_id;
+    const rates = document.createElement('div');
+    rates.className = 'genre-rates';
+    rates.textContent = '理解度 ' + topic.mastery_pct + '%';
+    head.append(name, rates);
+
+    row.append(head, genreBar(topic), genreNumbers(topic));
+
+    const mistakes = state.genreMistakes && state.genreMistakes.by_node
+      ? Number(state.genreMistakes.by_node[topic.node_id] || 0)
+      : null;
+    if (mistakes !== null) {
+      const line = document.createElement('div');
+      line.className = 'genre-numbers genre-mistakes';
+      line.textContent = 'これまでに間違えた問題: ' + mistakes + '問';
+      row.appendChild(line);
+    }
+    return row;
+  }
+
+  /*
+   * 帯グラフ。総問題数を1本の帯にして「最新正解 / 最新誤答 / 未回答」で割る。
+   * 0件の区画は要素ごと出さない（幅0の線が残らないようにする）。
+   */
+  function genreBar(counts) {
+    const bar = document.createElement('div');
+    bar.className = 'genre-bar';
+    const total = Number(counts.total) || 0;
+    if (!total) return bar;
+
+    [['correct', counts.latest_correct], ['wrong', counts.latest_wrong],
+     ['unanswered', counts.unanswered]].forEach(pair => {
+      const value = Number(pair[1]) || 0;
+      if (value <= 0) return;
+      const seg = document.createElement('div');
+      seg.className = 'genre-seg ' + pair[0];
+      seg.style.width = (value / total * 100) + '%';
+      bar.appendChild(seg);
+    });
+    return bar;
+  }
+
+  function genreNumbers(counts) {
+    const div = document.createElement('div');
+    div.className = 'genre-numbers';
+    div.innerHTML = '全<b>' + counts.total + '</b>問中　'
+      + '回答済み<b>' + counts.answered + '</b>問（' + counts.answered_pct + '%）'
+      + '／未回答<b>' + counts.unanswered + '</b>問　'
+      + '正解<b>' + counts.latest_correct + '</b>・誤答<b>' + counts.latest_wrong + '</b>'
+      + '（正答率' + counts.correct_pct + '%）';
+    return div;
+  }
+
+  /** ジャンル配下の論点ぶんを足す。読み込み前は null（行ごと出さない）。 */
+  function genreEverWrong(genre) {
+    if (!state.genreMistakes || !state.genreMistakes.by_node) return null;
+    return (genre.topics || []).reduce(
+      (sum, t) => sum + Number(state.genreMistakes.by_node[t.node_id] || 0), 0
+    );
+  }
+
   const MODES = ['learning', 'review', 'unanswered'];
 
   function startLearning(mode) {
@@ -189,12 +422,14 @@
     clearPrefetch();
     state.current = null;
     $('questionView').classList.add('hidden');
+    $('genreView').classList.add('hidden');
     $('homeView').classList.remove('hidden');
     loadHomeData();
   }
 
   function showQuestionView() {
     $('homeView').classList.add('hidden');
+    $('genreView').classList.add('hidden');
     $('questionView').classList.remove('hidden');
   }
 
@@ -492,6 +727,9 @@
           return;
         }
         rememberExcluded(q.question_id);
+        // サーバー側はここでジャンル別のキャッシュを捨てている。
+        // 画面が持っている集計も一緒に捨てないと、古い数字が残る。
+        forgetGenreData();
         renderResult(result);
       })
       .withFailureHandler(showServerError)

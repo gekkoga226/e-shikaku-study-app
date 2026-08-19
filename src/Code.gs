@@ -58,7 +58,12 @@ const LOG_PICK_COLUMNS = Object.freeze([
 const MINDMAP_PICK_COLUMNS = Object.freeze([
   'node_id', 'topic', 'major_area', 'mastery_pct', 'mastery_level',
   'weighted_accuracy', 'required_unique_questions', 'primary_unique_answered_count',
-  'latest_unique_correct_count', 'next_review_at', 'last_answered_at', 'progress_eligible'
+  'latest_unique_correct_count', 'next_review_at', 'last_answered_at', 'progress_eligible',
+  // ジャンル別の可視化で使う「その論点にprimaryで紐づくverified/activeな問題数」。
+  // 21列目にあり、上の列（20列目・22列目）に挟まれているので、
+  // maxGap でまとめ読みしている範囲の中に既に入っている。
+  // ＝この列を足しても、読み取りの回数も運ぶセルの数も1つも増えない。
+  'primary_verified_question_count'
 ]);
 
 /** 未回答かどうかの判定に必要な列だけ。 */
@@ -166,6 +171,260 @@ function clearWeaknessCache_() {
 function logElapsed_(label, startedAt) {
   try {
     console.log('[perf] ' + label + ': ' + (Date.now() - startedAt) + 'ms');
+  } catch (e) {}
+}
+
+/* ------------------------- ジャンル別の弱点の可視化 -------------------------
+ *
+ * 役割の境界（ここを越えない）:
+ * - 表示だけを行う。出題・採点・理解度・学習ログには一切関わらない。
+ * - 理解度をApps Script側で計算し直さない。02_マインドマップの値をそのまま畳むだけ。
+ * - APP_CONFIG.MODES へは追加しない。これは学習モードではなく画面である。
+ *
+ * 「ジャンル」= 02_マインドマップの major_area。
+ * このシートは2階層で、level 1 の5行（数学的基礎 / 機械学習 / 深層学習の基礎 /
+ * 深層学習の応用 / 開発・運用環境）が大分類、level 2 の22行が論点にあたる。
+ * 親子で major_area は同じ文字列なので、葉ノードの major_area だけで畳める。
+ *
+ * node_id の接頭辞では畳まないこと。
+ * APP-* の親は DL-APP、DL-* の親は DL-BASE で、接頭辞と大分類は一致しない。
+ *
+ * 数える元はすべて02_マインドマップのシート数式の値:
+ *   総問題数   primary_verified_question_count（verified かつ active な primary 接続問題）
+ *   回答済み   primary_unique_answered_count（04_学習ログ U列 counts_for_mastery が根拠）
+ *   最新正解   latest_unique_correct_count（各問題の最新の正式回答が正解のもの）
+ * 22論点の合計は 06_ダッシュボードの「verified問題数」「ユニーク回答済み問題数」と
+ * 一致する。ここで別の数え方を作らないこと。
+ */
+
+const GENRE_CACHE_KEY = 'genre_breakdown_v1';
+const GENRE_MISTAKE_CACHE_KEY = 'genre_mistakes_v1';
+const GENRE_CACHE_SECONDS = 300;
+const GENRE_UNKNOWN_LABEL = '未分類';
+
+/**
+ * ジャンル別の内訳を返す。
+ *
+ * 読むのは02_マインドマップだけで、範囲は getWeaknessData と同一。
+ * primary_verified_question_count は既にまとめ読みしている範囲の中にあるため、
+ * この画面のために増える読み取りは1回もない。
+ */
+function getGenreBreakdown() {
+  const startedAt = Date.now();
+
+  const cached = readGenreBreakdownCache_();
+  if (cached) return cached;
+
+  const data = buildGenreBreakdown_(readMindmapLeafNodes_());
+  writeGenreBreakdownCache_(data);
+  logElapsed_('getGenreBreakdown', startedAt);
+  return data;
+}
+
+/** 葉ノードを major_area ごとに畳む。理解度の計算はしない（足すだけ）。 */
+function buildGenreBreakdown_(nodes) {
+  const genres = [];
+  const byArea = {};
+
+  (nodes || []).forEach(node => {
+    const area = String(node.major_area || '').trim() || GENRE_UNKNOWN_LABEL;
+    if (!byArea[area]) {
+      byArea[area] = {
+        major_area: area,
+        topic_count: 0,
+        total: 0,
+        answered: 0,
+        unanswered: 0,
+        latest_correct: 0,
+        latest_wrong: 0,
+        topics: []
+      };
+      genres.push(byArea[area]);
+    }
+
+    const genre = byArea[area];
+    const topic = genreCounts_(node);
+    genre.topic_count++;
+    genre.total += topic.total;
+    genre.answered += topic.answered;
+    genre.unanswered += topic.unanswered;
+    genre.latest_correct += topic.latest_correct;
+    genre.latest_wrong += topic.latest_wrong;
+    genre.topics.push(topic);
+  });
+
+  genres.forEach(genre => {
+    genre.topics.sort(compareGenreTopics_);
+    addGenreRates_(genre);
+  });
+  genres.sort(compareGenres_);
+
+  return {
+    genres: genres,
+    totals: addGenreRates_(genres.reduce((acc, g) => {
+      acc.topic_count += g.topic_count;
+      acc.total += g.total;
+      acc.answered += g.answered;
+      acc.unanswered += g.unanswered;
+      acc.latest_correct += g.latest_correct;
+      acc.latest_wrong += g.latest_wrong;
+      return acc;
+    }, {
+      major_area: '合計', topic_count: 0, total: 0, answered: 0,
+      unanswered: 0, latest_correct: 0, latest_wrong: 0
+    })),
+    generatedAt: formatDateTime_(new Date())
+  };
+}
+
+/** 1論点ぶんの内訳。すべて02_マインドマップの値をそのまま使う。 */
+function genreCounts_(node) {
+  const total = numberOrZero_(node.primary_verified_question_count);
+  const answered = numberOrZero_(node.primary_unique_answered_count);
+  const latestCorrect = numberOrZero_(node.latest_unique_correct_count);
+
+  const counts = {
+    node_id: String(node.node_id || ''),
+    topic: String(node.topic || ''),
+    total: total,
+    answered: answered,
+    // 回答済みが総数を超えることは無い想定だが、負の未回答は表示できないので0で止める。
+    unanswered: Math.max(0, total - answered),
+    latest_correct: latestCorrect,
+    latest_wrong: Math.max(0, answered - latestCorrect),
+    mastery_pct: numberOrZero_(node.mastery_pct)
+  };
+  return addGenreRates_(counts);
+}
+
+/** 割合を足す。分母が0のときは0%にする（表示できない値を作らない）。 */
+function addGenreRates_(counts) {
+  counts.answered_pct = counts.total ? Math.round(counts.answered / counts.total * 100) : 0;
+  counts.unanswered_pct = counts.total ? 100 - counts.answered_pct : 0;
+  counts.correct_pct = counts.answered ? Math.round(counts.latest_correct / counts.answered * 100) : 0;
+  counts.wrong_pct = counts.answered ? 100 - counts.correct_pct : 0;
+  return counts;
+}
+
+/** 弱いジャンルほど先に出す。同点でも毎回同じ順番になるようにする。 */
+function compareGenres_(a, b) {
+  if (a.correct_pct !== b.correct_pct) return a.correct_pct - b.correct_pct;
+  if (a.answered_pct !== b.answered_pct) return a.answered_pct - b.answered_pct;
+  return String(a.major_area).localeCompare(String(b.major_area));
+}
+
+/** ジャンルの中の論点は、既存の弱点リストと同じ「理解度が低い順」に並べる。 */
+function compareGenreTopics_(a, b) {
+  if (a.mastery_pct !== b.mastery_pct) return a.mastery_pct - b.mastery_pct;
+  if (a.correct_pct !== b.correct_pct) return a.correct_pct - b.correct_pct;
+  return String(a.node_id).localeCompare(String(b.node_id));
+}
+
+/*
+ * 「これまでに一度でも間違えた問題数」だけを別の呼び出しにする。
+ *
+ * 画面の帯グラフは「最新の正式回答が不正解」（理解度v2と同じ最新の状態）で描く。
+ * こちらは押されたときだけ読む。初回表示を待たせないため。
+ *
+ * 04_学習ログはE列に primary_node_id を持っているので、
+ * 03_問題台帳を読まずに論点まで辿れる。返すのは論点ごとの件数だけで、
+ * ジャンルへの畳み込みはクライアントが既に持っている対応表で行う
+ * （02_マインドマップを二度読まないため）。
+ */
+const GENRE_LOG_COLUMNS = Object.freeze([
+  'question_id', 'primary_node_id', 'is_correct', 'counts_for_mastery'
+]);
+
+/*
+ * 04_学習ログでの位置は question_id=4 / primary_node_id=5 / is_correct=10 /
+ * counts_for_mastery=21（U列）。4〜10はまとめて読み、21は別に読む。
+ * 20列目の notes は1セルが長くなるため、跨がない値にしてある。
+ */
+const GENRE_LOG_MAX_GAP = 4;
+
+function getGenreMistakeHistory() {
+  const startedAt = Date.now();
+
+  const cached = readGenreMistakeCache_();
+  if (cached) return cached;
+
+  const data = buildGenreMistakeHistory_(
+    readColumns_(APP_CONFIG.SHEETS.LOG, GENRE_LOG_COLUMNS, { maxGap: GENRE_LOG_MAX_GAP })
+  );
+  writeGenreMistakeCache_(data);
+  logElapsed_('getGenreMistakeHistory', startedAt);
+  return data;
+}
+
+/**
+ * 一度でも不正解の正式回答をした問題を、question_id単位で数える。
+ * 同じ問題を何度間違えても1問。判定根拠は04_学習ログU列だけ（未回答モードと同じ）。
+ */
+function buildGenreMistakeHistory_(logs) {
+  const nodeByQuestion = {};
+
+  (logs || []).forEach(row => {
+    if (!truthy_(row.counts_for_mastery)) return;
+    if (truthy_(row.is_correct)) return;
+    const qid = String(row.question_id || '');
+    if (!qid || nodeByQuestion.hasOwnProperty(qid)) return;
+    nodeByQuestion[qid] = String(row.primary_node_id || '');
+  });
+
+  const byNode = {};
+  let total = 0;
+  Object.keys(nodeByQuestion).forEach(qid => {
+    total++;
+    const nodeId = nodeByQuestion[qid];
+    if (!nodeId) return;
+    byNode[nodeId] = (byNode[nodeId] || 0) + 1;
+  });
+
+  return { by_node: byNode, total: total };
+}
+
+function readGenreBreakdownCache_() {
+  try {
+    const raw = CacheService.getUserCache().get(GENRE_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && Array.isArray(parsed.genres) ? parsed : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeGenreBreakdownCache_(data) {
+  try {
+    CacheService.getUserCache().put(GENRE_CACHE_KEY, JSON.stringify(data), GENRE_CACHE_SECONDS);
+  } catch (e) {
+    // 使い回せなくても読み直せばよいので、失敗しても動作は変えない。
+  }
+}
+
+function readGenreMistakeCache_() {
+  try {
+    const raw = CacheService.getUserCache().get(GENRE_MISTAKE_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && parsed.by_node ? parsed : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeGenreMistakeCache_(data) {
+  try {
+    CacheService.getUserCache().put(
+      GENRE_MISTAKE_CACHE_KEY, JSON.stringify(data), GENRE_CACHE_SECONDS
+    );
+  } catch (e) {}
+}
+
+/** 回答を書き込んだ直後に呼ぶ。次に開いたときジャンル別の数字が新しくなる。 */
+function clearGenreBreakdownCache_() {
+  try {
+    const cache = CacheService.getUserCache();
+    cache.remove(GENRE_CACHE_KEY);
+    cache.remove(GENRE_MISTAKE_CACHE_KEY);
   } catch (e) {}
 }
 
@@ -576,6 +835,7 @@ function submitAnswer(payload) {
     // 1問解いたぶん、ホーム画面の未回答残数と弱点リストを取り直させる。
     clearUnansweredSummaryCache_();
     clearWeaknessCache_();
+    clearGenreBreakdownCache_();
 
     return {
       ok: true,
@@ -646,6 +906,31 @@ function runSelfTest() {
       'Unanswered summary',
       unanswered.formal_total === eligibleCount && unanswered.remaining <= unanswered.formal_total,
       unanswered.remaining + ' / ' + unanswered.formal_total
+    );
+
+    /*
+     * ジャンル別画面の内訳（読むだけ。ログには書かない）。
+     *
+     * 内訳そのものの整合（回答済み<=総数、最新正解<=回答済み）を確認し、
+     * 06_ダッシュボードおよび未回答モードの数え方との突き合わせを detail に出す。
+     * 総問題数は02_マインドマップの primary_verified_question_count を採用しているため、
+     * 03_問題台帳の isFormalQuestion_ 基準とは一致しない場合がある。
+     * どちらが正しいかを機械が決められないので、ここでは失敗にせず両方の数字を残す。
+     */
+    const genre = getGenreBreakdown();
+    const verifiedLabel = readDashboard_().filter(x => x.label === 'verified問題数')[0];
+    push(
+      'Genre breakdown',
+      genre.genres.length > 0
+        && genre.totals.total > 0
+        && genre.totals.answered <= genre.totals.total
+        && genre.totals.latest_correct <= genre.totals.answered,
+      genre.genres.length + 'ジャンル / ' + genre.totals.topic_count + '論点'
+        + ' / 総数' + genre.totals.total
+        + '（06_ダッシュボード: ' + (verifiedLabel ? verifiedLabel.value : '不明')
+        + ' / 03_問題台帳の正式問題: ' + unanswered.formal_total + '）'
+        + ' / 回答済み' + genre.totals.answered
+        + '（未回答モードの数え方: ' + unanswered.answered_unique + '）'
     );
 
     return {
@@ -1269,6 +1554,7 @@ function readMindmapLeafNodes_() {
       required_unique_questions: numberOrZero_(r.required_unique_questions),
       primary_unique_answered_count: numberOrZero_(r.primary_unique_answered_count),
       latest_unique_correct_count: numberOrZero_(r.latest_unique_correct_count),
+      primary_verified_question_count: numberOrZero_(r.primary_verified_question_count),
       next_review_at: r.next_review_at || '',
       last_answered_at: r.last_answered_at || ''
     }));
