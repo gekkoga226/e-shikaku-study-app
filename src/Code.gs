@@ -517,7 +517,7 @@ function getNextQuestion(request) {
 
     for (const item of scored) {
       if (imageSupportAllowsQuestionObject_(item.q)) {
-        return publicQuestion_(item.q, node, mode);
+        return publicQuestion_(item.q, node, mode, !!latest[String(item.q.question_id)]);
       }
     }
   }
@@ -529,7 +529,7 @@ function getNextQuestion(request) {
   for (const q of fallback) {
     if (!imageSupportAllowsQuestionObject_(q)) continue;
     const node = nodes.find(n => n.node_id === String(q.primary_node_id || '')) || null;
-    return publicQuestion_(q, node, mode);
+    return publicQuestion_(q, node, mode, !!latest[String(q.question_id)]);
   }
 
   // 画像を用意できる問題が1問も無い状態。回答させないほうが安全なので出題しない。
@@ -598,7 +598,8 @@ function nextUnansweredQuestion_(formalQuestions, logs, excludes) {
 
   const node = nodeById[String(picked.primary_node_id || '')] || null;
 
-  const payload = publicQuestion_(picked, node, 'unanswered');
+  // 未回答モードで選ばれた時点で、正式回答は1件も無い問題である。
+  const payload = publicQuestion_(picked, node, 'unanswered', false);
   payload.remaining_unanswered = unanswered.length;
   return payload;
 }
@@ -962,6 +963,19 @@ const AI_CONFIG = Object.freeze({
   CACHE_PREFIX: 'aiexpl:',
   CACHE_SECONDS: 3600,
   MAX_CACHE_CHARS: 90000,
+  /*
+   * 生成した解説を残しておくシート。
+   *
+   * CacheService のキーは attempt_id で、回答1回ごとに必ず変わる。
+   * そのため同じ問題を解き直すたびに作り直しになっていた。
+   * ここには question_id と選んだ選択肢の組で残し、次に同じ間違いをしたとき
+   * すぐ出せるようにする。理解度・採点・出題には一切使わない。
+   */
+  SHEET: '07_AI解説キャッシュ',
+  SHEET_HEADERS: ['question_id', 'user_answer', 'source_signature', 'model', 'generated_at', 'explanation_text'],
+  // シートのセルは5万文字まで入るが、解説は日本語1200文字程度。
+  // 想定外に長いものを書き込んで表を壊さないよう、余裕をもって上限を置く。
+  MAX_SHEET_CHARS: 20000,
   MAX_IMAGE_PARTS: 8,
   // 本文は日本語800〜1200文字を求めている。日本語はおおむね1文字1トークン以上で、
   // LaTeXの記号もトークンを食う。さらに今のモデルは答える前に内部で考え、
@@ -1034,26 +1048,68 @@ function getAiExplanation(request) {
     return aiFailure_('MISSING_ATTEMPT_ID', 'AI解説を出すには、どの回答についてかを示すIDが必要です。');
   }
 
+  // 「もう一度作る」で押されたときは、残っているものを一切見ずに作り直す。
+  // 納得できない解説が残ったまま出続けるのを避けるため。
+  const force = request.force === true;
+
   // 同じattemptの解説は1時間キャッシュし、連打でAPI使用量が増えないようにする。
   // このキャッシュはユーザー単位で、回答済みの確認を通ったあとにしか書かれない。
   // つまりキャッシュに存在する時点で「回答済み」が保証されている。
   const cacheKey = AI_CONFIG.CACHE_PREFIX + attemptId;
-  const cached = aiCacheGet_(cacheKey);
-  if (cached && cached.text) {
-    return {
-      ok: true,
-      attempt_id: attemptId,
-      model: String(cached.model || ''),
-      text: String(cached.text),
-      truncated: cached.truncated === true,
-      cached: true,
-      disclaimer: AI_DISCLAIMER
-    };
+  if (!force) {
+    const cached = aiCacheGet_(cacheKey);
+    if (cached && cached.text) {
+      return {
+        ok: true,
+        attempt_id: attemptId,
+        model: String(cached.model || ''),
+        text: String(cached.text),
+        truncated: cached.truncated === true,
+        cached: true,
+        source: 'memory',
+        disclaimer: AI_DISCLAIMER
+      };
+    }
   }
 
   // ここを通らない限り、正解も解説も1文字も外へ出さない。
   const found = readAnsweredAttempt_(attemptId);
   if (!found.ok) return found;
+
+  const qid = String(found.question.question_id || '').trim();
+  const userAnswer = String(aiPick_(found.attempt, ['user_answer', 'user_option', 'selected_option']) || '')
+    .trim().toUpperCase();
+  const signature = aiSourceSignature_(found.question, userAnswer);
+
+  /*
+   * シートに残っている解説を使う。
+   *
+   * 内容を決めているのは question_id と選んだ選択肢の組だけで、
+   * 正誤は正解が固定なのでこの2つから決まる。自信度はプロンプトに入るが、
+   * システム指示が「自信度そのものに言及しない」と定めているため本文には出ない。
+   * したがって別の回答回でもそのまま使い回せる。
+   *
+   * 問題文・選択肢・登録解説が書き換わった場合は署名が変わるので、
+   * 古い内容をそのまま出し続けることはない。
+   */
+  if (!force) {
+    const stored = aiSheetLookup_(qid, userAnswer, signature);
+    if (stored && stored.text) {
+      // 次の連打はシートまで行かずに済むよう、手前のキャッシュにも載せておく。
+      aiCachePut_(cacheKey, { model: stored.model, text: stored.text });
+      return {
+        ok: true,
+        attempt_id: attemptId,
+        model: String(stored.model || ''),
+        text: String(stored.text),
+        truncated: false,
+        cached: true,
+        source: 'sheet',
+        generated_at: String(stored.generated_at || ''),
+        disclaimer: AI_DISCLAIMER
+      };
+    }
+  }
 
   const properties = PropertiesService.getScriptProperties();
   const apiKey = properties.getProperty(AI_CONFIG.API_KEY_PROPERTY);
@@ -1069,10 +1125,11 @@ function getAiExplanation(request) {
   const generated = callGeminiGenerateContent_(model, apiKey, parts);
   if (!generated.ok) return generated;
 
-  // 途中で切れた解説をキャッシュすると、1時間ずっと切れたものが再表示される。
-  // 切れたときは残さず、「もう一度作る」で作り直せるようにする。
+  // 途中で切れた解説を残すと、次からずっと切れたものが再表示される。
+  // 切れたときはどこにも残さず、「もう一度作る」で作り直せるようにする。
   if (generated.truncated !== true) {
     aiCachePut_(cacheKey, { model: model, text: generated.text });
+    aiSheetSave_(qid, userAnswer, signature, model, generated.text);
   }
 
   return {
@@ -1082,14 +1139,141 @@ function getAiExplanation(request) {
     text: generated.text,
     truncated: generated.truncated === true,
     cached: false,
+    source: 'generated',
     disclaimer: AI_DISCLAIMER
   };
 }
 
-/**
- * 04_学習ログに write_status=success で記録済みの回答だけを認める。
- * 見つからなければ、正解に関する情報を含めずに失敗を返す。
+/* ------------------- 生成した解説をシートへ残す（表示用だけ） -------------------
+ *
+ * 役割の境界（ここを越えない）:
+ * - 理解度・採点・出題・学習ログには一切関わらない。読むのも書くのもこのシートだけ。
+ * - 02_マインドマップ / 03_問題台帳 / 04_学習ログ へは書き込まない。
+ * - このシートが無くても壊れない。作れなければ、これまでどおり毎回生成へ戻るだけ。
+ * - セルフテストからは呼ばない（テストは書き込まない約束のため）。
  */
+
+/**
+ * 解説の中身を決めている材料の署名。
+ *
+ * 自信度は含めない。プロンプトには入るが、システム指示が言及を禁じているので
+ * 本文には現れず、含めると使い回せる場面が1/3になってしまう。
+ * 逆に問題文・選択肢・登録解説が書き換わったら署名が変わってほしいので、
+ * それらはすべて含める。
+ */
+function aiSourceSignature_(question, userAnswer) {
+  const letters = availableOptionLetters_(question);
+  const source = [
+    String(question.question_id || ''),
+    String(userAnswer || ''),
+    String(question.correct_option || '').trim().toUpperCase(),
+    String(question.question_text || ''),
+    letters.map(l => l + ':' + String(question['option_' + l.toLowerCase()] || '')).join('\u0001'),
+    String(question.explanation_plain || ''),
+    String(question.explanation_formal || ''),
+    String(question.explanation_calculation || ''),
+    String(question.explanation_options || ''),
+    String(question.question_image_refs || '')
+  ].join('\u0000');
+
+  try {
+    const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, source, Utilities.Charset.UTF_8);
+    return digest.map(b => ((b < 0 ? b + 256 : b).toString(16)).padStart(2, '0')).join('').slice(0, 32);
+  } catch (e) {
+    // 署名を作れないときは「毎回作り直す」側へ倒す（古い内容を出し続けない）。
+    return '';
+  }
+}
+
+/** キャッシュシートを返す。無ければ作る。作れなければ null（動作は変えない）。 */
+function aiSheet_(createIfMissing) {
+  try {
+    const ss = spreadsheet_();
+    let sh = ss.getSheetByName(AI_CONFIG.SHEET);
+    if (sh) return sh;
+    if (!createIfMissing) return null;
+
+    // 既存のシートの並びを崩さないよう、いちばん右へ足す。
+    sh = ss.insertSheet(AI_CONFIG.SHEET, ss.getNumSheets());
+    sh.getRange(1, 1, 1, AI_CONFIG.SHEET_HEADERS.length).setValues([AI_CONFIG.SHEET_HEADERS.slice()]);
+    sh.setFrozenRows(1);
+    return sh;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 残してある解説を探す。
+ *
+ * 本文の列は1セルが数千文字になるので、まとめて読んではいけない。
+ * まず短いキー列（1〜3列目）だけを読んで行を決め、
+ * 見つかった1行の本文セルだけを読む。
+ */
+function aiSheetLookup_(questionId, userAnswer, signature) {
+  if (!questionId || !userAnswer || !signature) return null;
+
+  try {
+    const sh = aiSheet_(false);
+    if (!sh) return null;
+
+    const lastRow = sh.getLastRow();
+    if (lastRow < 2) return null;
+
+    const keys = sh.getRange(2, 1, lastRow - 1, 3).getValues();
+    for (let i = keys.length - 1; i >= 0; i--) {
+      if (String(keys[i][0]) !== String(questionId)) continue;
+      if (String(keys[i][1]).trim().toUpperCase() !== String(userAnswer)) continue;
+      // 問題文や登録解説が書き換わっていたら、残っている内容は使わない。
+      if (String(keys[i][2]) !== String(signature)) continue;
+
+      const row = i + 2;
+      const rest = sh.getRange(row, 4, 1, 3).getValues()[0];
+      const text = String(rest[2] || '');
+      if (!text) return null;
+      return { model: String(rest[0] || ''), generated_at: formatMaybeDate_(rest[1]), text: text, row: row };
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 生成した解説を残す。同じ組が既にあれば上書きし、行を増やさない。
+ * 失敗しても解説はもう画面へ返せるので、静かに諦める。
+ */
+function aiSheetSave_(questionId, userAnswer, signature, model, text) {
+  if (!questionId || !userAnswer || !signature) return;
+  if (!text || text.length > AI_CONFIG.MAX_SHEET_CHARS) return;
+
+  try {
+    const sh = aiSheet_(true);
+    if (!sh) return;
+
+    const lastRow = sh.getLastRow();
+    let target = 0;
+    if (lastRow >= 2) {
+      const keys = sh.getRange(2, 1, lastRow - 1, 2).getValues();
+      for (let i = keys.length - 1; i >= 0; i--) {
+        if (String(keys[i][0]) !== String(questionId)) continue;
+        if (String(keys[i][1]).trim().toUpperCase() !== String(userAnswer)) continue;
+        target = i + 2;
+        break;
+      }
+    }
+    if (!target) target = lastRow + 1;
+
+    sh.getRange(target, 1, 1, AI_CONFIG.SHEET_HEADERS.length).setValues([[
+      questionId, userAnswer, signature, model, new Date(), text
+    ]]);
+    sh.getRange(target, 5).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+  } catch (e) {
+    // 残せなくても、次に開いたとき作り直せばよい。
+  }
+}
+
+
 function readAnsweredAttempt_(attemptId) {
   // 読み取りだけなので共有ハンドルを使う（AI解説1回につき1度の接続で済む）。
   const ss = spreadsheet_();
@@ -1560,7 +1744,7 @@ function readMindmapLeafNodes_() {
     }));
 }
 
-function publicQuestion_(q, node, mode) {
+function publicQuestion_(q, node, mode, previouslyAnswered) {
   const options = {};
   availableOptionLetters_(q).forEach(letter => {
     options[letter] = String(q['option_' + letter.toLowerCase()] || '');
@@ -1579,7 +1763,21 @@ function publicQuestion_(q, node, mode) {
     mastery_level: node ? node.mastery_level : '',
     difficulty: String(q.difficulty || 'standard'),
     mode,
-    image_required: !!String(q.question_image_refs || '').trim()
+    image_required: !!String(q.question_image_refs || '').trim(),
+    /*
+     * この問題に正式回答したことがあるか。
+     *
+     * 判定根拠は04_学習ログU列（latestFormalLogByQuestion_）で、
+     * 出題側が優先順位づけのために既に作っている表をそのまま使う。
+     * ＝この値のために読み取りは1回も増えない。
+     *
+     * 使い道は結果画面でAI解説を先読みするかどうかだけ。正解は含まない。
+     *
+     * 呼び出し側が渡し忘れたときは「解き直し」として扱う。
+     * そうしておけば、抜けても先読みが止まるだけで済む。
+     * 逆にすると、押されないAI解説を黙って作り続けることになる。
+     */
+    previously_answered: previouslyAnswered !== false
   };
 }
 
