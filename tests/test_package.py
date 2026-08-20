@@ -22,7 +22,10 @@ def main():
     assert (SRC / 'Client.html').exists()
 
     code = (SRC / 'Code.gs').read_text(encoding='utf-8')
-    m = re.search(r'function publicQuestion_\(q, node, mode\) \{([\s\S]*?)\n\}', code)
+    # 引数の数は増えることがある（先読みの判定用の旗など）。
+    # ここで確かめたいのは「回答前の応答へ正解を載せていない」ことだけなので、
+    # 引数の並びではなく関数の中身を見る。
+    m = re.search(r'function publicQuestion_\([^)]*\) \{([\s\S]*?)\n\}', code)
     assert m, 'publicQuestion_ not found'
     assert 'correct_option' not in m.group(1), 'correct_option leaked by publicQuestion_'
 

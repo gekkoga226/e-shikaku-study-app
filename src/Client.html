@@ -18,7 +18,15 @@
     // ジャンル別画面。表示するだけで、出題・採点・理解度には一切関わらない。
     genre: null,
     genreMistakes: null,
-    genreOpen: new Set()
+    genreOpen: new Set(),
+    /*
+     * 結果画面を読んでいるあいだに用意しておくAI解説。
+     * status は 'loading' | 'done' | 'failed'。
+     * 先読みの最中にボタンを押されても2回生成しないよう、ここで待ち合わせる。
+     */
+    aiPrefetch: null,
+    aiWanted: false,
+    aiShownAttemptId: ''
   };
 
   const $ = id => document.getElementById(id);
@@ -35,7 +43,10 @@
     $('noticeHomeBtn').addEventListener('click', showHome);
     $('nextBtn').addEventListener('click', loadNextQuestion);
     $('submitBtn').addEventListener('click', submitCurrentAnswer);
-    $('aiExplainBtn').addEventListener('click', requestAiExplanation);
+    $('aiExplainBtn').addEventListener('click', () => {
+      // 一度出したあとの押下は「もう一度作る」＝保存を使わず作り直す。
+      requestAiExplanation(state.aiShownAttemptId === state.attemptId);
+    });
     $('lightboxClose').addEventListener('click', closeLightbox);
     $('lightboxZoomBtn').addEventListener('click', toggleLightboxZoom);
     $('lightbox').addEventListener('click', e => { if (e.target === $('lightbox')) closeLightbox(); });
@@ -744,6 +755,12 @@
   }
 
   function renderResult(r) {
+    // この下で state.current を消すので、先に「解き直しかどうか」を控えておく。
+    // 判定できないときは解き直し扱いにして、先読みを走らせない。
+    const previouslyAnswered = state.current
+      ? state.current.previously_answered === true
+      : true;
+
     // AI補助解説は、この attempt_id が実在する回答にだけ紐づく。
     state.attemptId = String(r.attempt_id || '');
     resetAiExplanation();
@@ -780,6 +797,11 @@
 
     // 解説を読んでいるあいだに、次の1問を裏で用意しておく。
     prefetchNextQuestion();
+
+    // 同じあいだに、AI解説も裏で作り始めておく（条件を満たすときだけ）。
+    if (shouldPrefetchAi(r, previouslyAnswered)) {
+      startAiPrefetch(state.attemptId);
+    }
   }
 
   /* ------------------------- 次の問題の先読み -------------------------
@@ -874,6 +896,8 @@
 
   function resetAiExplanation() {
     state.aiSeq += 1;
+    // 前の問題ぶんの先読み結果を持ち越さない。
+    clearAiPrefetch();
 
     const box = $('aiExplanationBox');
     box.textContent = '';
@@ -889,50 +913,152 @@
   }
 
   // AIはこのボタンを押したときだけ呼ぶ（毎問自動では呼ばない）。
-  function requestAiExplanation() {
+  /* ------------------ AI補助解説（先読みつき・表示だけ） ------------------
+   *
+   * 生成には数秒かかる。結果画面を読んでいるあいだに裏で作り始めておくと、
+   * 押したときには出来ていることが多い。
+   *
+   * 先読みするのは次の2つを両方満たすときだけ。
+   *   1. 登録解説（explanation_*）が1つも無い
+   *      ＝AI解説がその問題の唯一の解説になるので、押される見込みが高い
+   *   2. その問題に正式回答したことがない（2回目以降は先読みしない）
+   *      ＝解き直しでは以前の解説がシートに残っている見込みがあり、
+   *        押されないまま生成してAPIを使うのを避ける
+   *
+   * 採点・理解度・学習ログには一切関わらない（読むだけの呼び出し）。
+   */
+  function shouldPrefetchAi(result, previouslyAnswered) {
+    if (!state.attemptId) return false;
+    // 2回目以降の問題では先読みしない。
+    // 分からないときも「先読みしない」側へ倒す（押されない生成を増やさない）。
+    if (previouslyAnswered !== false) return false;
+    return !hasRegisteredExplanation(result);
+  }
+
+  function hasRegisteredExplanation(r) {
+    return ['explanation_plain', 'explanation_formal',
+            'explanation_calculation', 'explanation_options']
+      .some(key => String((r && r[key]) || '').trim());
+  }
+
+  function clearAiPrefetch() {
+    state.aiPrefetch = null;
+    state.aiWanted = false;
+    state.aiShownAttemptId = '';
+  }
+
+  function startAiPrefetch(attemptId) {
+    state.aiPrefetch = { attemptId: attemptId, status: 'loading', result: null };
+
+    google.script.run
+      .withSuccessHandler(res => {
+        const slot = state.aiPrefetch;
+        if (!slot || slot.attemptId !== attemptId) return;
+        slot.status = (res && res.ok) ? 'done' : 'failed';
+        slot.result = res;
+        // 出来上がる前に押されていたら、そのまま画面へ出す。
+        if (state.aiWanted) {
+          state.aiWanted = false;
+          if (slot.status === 'done') showAiExplanation(res);
+          else requestAiExplanation(false);
+        }
+      })
+      .withFailureHandler(() => {
+        const slot = state.aiPrefetch;
+        if (!slot || slot.attemptId !== attemptId) return;
+        slot.status = 'failed';
+        // 先読みが失敗しただけなら黙って捨て、押されたときに作り直す。
+        if (state.aiWanted) {
+          state.aiWanted = false;
+          requestAiExplanation(false);
+        }
+      })
+      .getAiExplanation({ attemptId: attemptId });
+  }
+
+  function requestAiExplanation(force) {
     if (!state.attemptId) {
       showToast('回答が記録された問題にだけAI解説を出せます。');
       return;
     }
 
+    // すでに解説を出したあとの「もう一度作る」は、残っているものを使わず作り直す。
+    const regenerate = force === true;
+
+    const slot = state.aiPrefetch;
+    if (!regenerate && slot && slot.attemptId === state.attemptId) {
+      if (slot.status === 'done') {
+        showAiExplanation(slot.result);
+        return;
+      }
+      if (slot.status === 'loading') {
+        // 先読みが走っている最中。二重に生成させず、出来上がりを待つ。
+        state.aiWanted = true;
+        setAiWaiting();
+        return;
+      }
+    }
+
     const seq = ++state.aiSeq;
-    const btn = $('aiExplainBtn');
-    const status = $('aiStatus');
-    btn.disabled = true;
-    status.textContent = 'AIが補助解説を作っています。少しお待ちください。';
-    status.classList.remove('hidden');
+    setAiWaiting();
 
     google.script.run
       .withSuccessHandler(res => {
         if (seq !== state.aiSeq) return;
-        btn.disabled = false;
-
-        if (!res || !res.ok) {
-          status.textContent = (res && res.message)
-            ? res.message
-            : 'AI補助解説を取得できませんでした。採点と理解度の記録は正常です。';
-          return;
-        }
-
-        status.textContent = 'モデル: ' + (res.model || '') +
-          (res.cached ? '（1時間以内に作成済みの結果を再表示）' : '') +
-          (res.truncated
-            ? '　※解説が長くなりすぎて途中で切れています。「AI解説をもう一度作る」でやり直せます。'
-            : '');
-        const box = $('aiExplanationBox');
-        box.textContent = res.text || '';
-        renderMathIn(box);
-        box.classList.remove('hidden');
-        btn.textContent = 'AI解説をもう一度作る';
+        showAiExplanation(res);
       })
       .withFailureHandler(err => {
         if (seq !== state.aiSeq) return;
-        btn.disabled = false;
-        status.textContent = (err && err.message)
+        $('aiExplainBtn').disabled = false;
+        $('aiStatus').textContent = (err && err.message)
           ? err.message
           : 'AI補助解説を取得できませんでした。採点と理解度の記録は正常です。';
       })
-      .getAiExplanation({ attemptId: state.attemptId });
+      .getAiExplanation({ attemptId: state.attemptId, force: regenerate });
+  }
+
+  function setAiWaiting() {
+    const status = $('aiStatus');
+    $('aiExplainBtn').disabled = true;
+    status.textContent = 'AIが補助解説を作っています。少しお待ちください。';
+    status.classList.remove('hidden');
+  }
+
+  function showAiExplanation(res) {
+    const btn = $('aiExplainBtn');
+    const status = $('aiStatus');
+    btn.disabled = false;
+
+    if (!res || !res.ok) {
+      status.textContent = (res && res.message)
+        ? res.message
+        : 'AI補助解説を取得できませんでした。採点と理解度の記録は正常です。';
+      return;
+    }
+
+    status.textContent = 'モデル: ' + (res.model || '') +
+      aiSourceLabel(res) +
+      (res.truncated
+        ? '　※解説が長くなりすぎて途中で切れています。「AI解説をもう一度作る」でやり直せます。'
+        : '');
+    const box = $('aiExplanationBox');
+    box.textContent = res.text || '';
+    renderMathIn(box);
+    box.classList.remove('hidden');
+    btn.textContent = 'AI解説をもう一度作る';
+    // これ以降の「もう一度作る」は、残っているものを使わず作り直す。
+    state.aiShownAttemptId = String(res.attempt_id || state.attemptId || '');
+  }
+
+  // どこから出てきた解説かを正直に書く。押すたび作り直していると誤解させない。
+  function aiSourceLabel(res) {
+    if (!res.cached) return '';
+    if (res.source === 'sheet') {
+      return res.generated_at
+        ? '（' + res.generated_at + ' に作成した解説を再表示）'
+        : '（保存済みの解説を再表示）';
+    }
+    return '（1時間以内に作成済みの結果を再表示）';
   }
 
   function rememberExcluded(qid) {

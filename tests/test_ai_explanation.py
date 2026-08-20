@@ -350,6 +350,48 @@ class TestAiDoesNotTouchLearningState(unittest.TestCase):
                         '既存の登録解説よりAI解説を先に表示しています')
 
 
+class TestAiCacheSheetIsIsolated(unittest.TestCase):
+    """生成した解説を残すシートが、学習データへ影響しないこと。"""
+
+    WRITERS = ('aiSheet_', 'aiSheetSave_')
+
+    def test_writers_touch_only_the_cache_sheet(self):
+        code = read('Code.gs')
+        for name in self.WRITERS:
+            body = strip_comments(function_body(code, name))
+            for forbidden in ('SHEETS.MINDMAP', 'SHEETS.LOG', 'SHEETS.QUESTIONS',
+                              'SHEETS.SETTINGS', 'SHEETS.DASHBOARD'):
+                self.assertNotIn(forbidden, body,
+                                 f'{name} が学習データのシートへ触れています: {forbidden}')
+            self.assertIn('AI_CONFIG.SHEET', body,
+                          f'{name} がAI解説キャッシュ以外へ書こうとしています')
+
+    def test_writers_do_not_use_the_answer_write_path(self):
+        code = read('Code.gs')
+        for name in self.WRITERS:
+            body = strip_comments(function_body(code, name))
+            self.assertNotIn('SpreadsheetApp.flush', body,
+                             f'{name} が回答と同じ書き込み確定を行っています')
+            self.assertNotIn('LockService', body,
+                             f'{name} が回答用のロックを使っています')
+
+    def test_lookup_never_reads_the_long_text_column_in_bulk(self):
+        """本文の列を全行まとめて読まないこと（1セルが数千文字になるため）。"""
+        body = strip_comments(function_body(read('Code.gs'), 'aiSheetLookup_'))
+        # 短いキー列(1〜3)だけを全行読み、本文は見つかった1行からだけ取る。
+        self.assertIn('getRange(2, 1, lastRow - 1, 3)', body,
+                      'キー列だけを読む形になっていません')
+        self.assertNotIn('lastRow - 1, 6', body,
+                         '本文の列まで全行読みしています')
+
+    def test_self_test_does_not_create_the_sheet(self):
+        """セルフテストは書き込まない約束なので、シートを作らせない。"""
+        body = strip_comments(function_body(read('Code.gs'), 'runSelfTest'))
+        for name in ('aiSheet_', 'aiSheetSave_', 'getAiExplanation'):
+            self.assertNotIn(name + '(', body,
+                             f'runSelfTest が {name} を呼んでいます')
+
+
 class TestImageInlineData(unittest.TestCase):
     """画像問題では既存の取得処理を再利用し inline_data として渡すこと。"""
 
@@ -420,20 +462,34 @@ class TestClientCallsAiOnlyOnDemand(unittest.TestCase):
     def setUpClass(cls):
         cls.script = html_script('Client.html')
 
-    def test_ai_is_called_only_from_the_button_handler(self):
+    def test_ai_is_called_from_exactly_two_places(self):
+        """AIを呼ぶのは「ボタン処理」と「結果画面の先読み」の2か所だけ。
+
+        先読みを足したので1か所ではなくなったが、増やしてよいのはここまで。
+        回答が記録される前に呼ぶ経路は、これまでどおり1つも無い。
+        """
         stripped = strip_comments(self.script)
         self.assertEqual(
-            stripped.count('.getAiExplanation('), 1,
-            'AI呼び出しが複数箇所にあります（自動呼び出しの疑い）',
+            stripped.count('.getAiExplanation('), 2,
+            'AI呼び出しが想定より多い箇所にあります（自動呼び出しの疑い）',
         )
-        body = strip_comments(function_body(self.script, 'requestAiExplanation'))
-        self.assertIn('.getAiExplanation({ attemptId: state.attemptId })', body,
-                      'ボタン処理からAIを呼んでいません')
+        for func in ('requestAiExplanation', 'startAiPrefetch'):
+            body = strip_comments(function_body(self.script, func))
+            self.assertIn('.getAiExplanation(', body,
+                          f'{func} からAIを呼んでいません')
+
+    def test_prefetch_only_runs_after_an_answer_is_recorded(self):
+        """先読みは attempt_id が実在するときだけ動くこと。"""
+        body = strip_comments(function_body(self.script, 'shouldPrefetchAi'))
+        self.assertIn('state.attemptId', body,
+                      '回答の記録を確認せずに先読みしています')
 
     def test_button_is_wired(self):
         stripped = strip_comments(self.script)
-        self.assertIn("$('aiExplainBtn').addEventListener('click', requestAiExplanation)", stripped,
+        self.assertIn("$('aiExplainBtn').addEventListener('click'", stripped,
                       'AIボタンが処理へつながっていません')
+        self.assertIn('requestAiExplanation(', stripped,
+                      'AIボタンからAI処理を呼んでいません')
         self.assertIn('AIでさらに噛み砕く', read('Index.html'),
                       'AIボタンの表示名がありません')
 
