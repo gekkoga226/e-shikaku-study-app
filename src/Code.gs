@@ -959,6 +959,32 @@ const AI_CONFIG = Object.freeze({
   API_KEY_PROPERTY: 'GEMINI_API_KEY',
   MODEL_PROPERTY: 'GEMINI_MODEL',
   DEFAULT_MODEL: 'gemini-3.5-flash',
+  /*
+   * 予備モデル（主モデルの1日ぶんの回数を使い切った日だけ使う）。
+   *
+   * ここでの仕事は「登録済みの解説を言い換える」ことだけなので、
+   * 軽いモデルでも役目は果たせる。主モデルが使えるあいだは呼ばない。
+   * モデル名を変えたくなったら、スクリプトプロパティ側で上書きできる。
+   */
+  FALLBACK_MODEL_PROPERTY: 'GEMINI_FALLBACK_MODEL',
+  DEFAULT_FALLBACK_MODEL: 'gemini-3.5-flash-lite',
+  // 'false' を入れると予備モデルを使わない（AIは主モデルだけ・枯渇したら停止）。
+  FALLBACK_ENABLED_PROPERTY: 'GEMINI_FALLBACK_ENABLED',
+  /*
+   * 「このモデルは今日ぶんを使い切った」を覚えておく場所。
+   *
+   * 利用枠はAPIキー（＝プロジェクト）単位なので、利用者ごとのCacheServiceでは共有できない。
+   * スクリプトプロパティなら実行をまたいで残り、全員で同じ状態を見られる。
+   * 中身は {"モデル名": 解除時刻(ミリ秒)} のJSON。学習データとは無関係。
+   */
+  QUOTA_STATE_PROPERTY: 'AI_MODEL_QUOTA_BLOCK',
+  QUOTA_RESET_TIMEZONE_PROPERTY: 'GEMINI_QUOTA_RESET_TIMEZONE',
+  // Geminiの1日ぶんの枠は日本時間ではなく米国太平洋時間の0時に戻る（夏時間も自動で追従する）。
+  DEFAULT_QUOTA_RESET_TIMEZONE: 'America/Los_Angeles',
+  // これより長く「待て」と言われたら、分単位の混雑ではなく1日ぶんの枯渇とみなす。
+  LONG_RETRY_SECONDS: 300,
+  // 記録が壊れていても、丸1日を超えてAIを止め続けない（26時間）。
+  MAX_QUOTA_BLOCK_SECONDS: 93600,
   ENDPOINT_BASE: 'https://generativelanguage.googleapis.com/v1beta/models/',
   CACHE_PREFIX: 'aiexpl:',
   CACHE_SECONDS: 3600,
@@ -972,7 +998,18 @@ const AI_CONFIG = Object.freeze({
    * すぐ出せるようにする。理解度・採点・出題には一切使わない。
    */
   SHEET: '07_AI解説キャッシュ',
-  SHEET_HEADERS: ['question_id', 'user_answer', 'source_signature', 'model', 'generated_at', 'explanation_text'],
+  SHEET_HEADERS: ['question_id', 'user_answer', 'source_signature', 'model', 'generated_at',
+                  'explanation_text', 'prompt_version'],
+  /*
+   * 解説の書き方（AI_SYSTEM_INSTRUCTION）の版。
+   *
+   * 残した解説がどの指示で作られたかを記録しておくための印で、
+   * 使い回してよいかの判定には使わない（＝この列を足しても既存の解説は無効化されない）。
+   * 将来、書き方を大きく変えて古い解説を作り直させたくなったときだけ、
+   * 下の RETIRED_PROMPT_VERSIONS へ古い版を並べる。
+   */
+  PROMPT_VERSION: 'ai_explanation_v2',
+  RETIRED_PROMPT_VERSIONS: [],
   // シートのセルは5万文字まで入るが、解説は日本語1200文字程度。
   // 想定外に長いものを書き込んで表を壊さないよう、余裕をもって上限を置く。
   MAX_SHEET_CHARS: 20000,
@@ -1006,8 +1043,10 @@ const AI_SYSTEM_INSTRUCTION = [
   '  ドル記号（$）は金額と紛らわしいので数式の区切りに使わないでください。',
   '  例: 平均は \\( \\frac{1}{n}\\sum_{i=1}^{n} x_i \\) で求めます。ここで n はデータの個数です。',
   '  数式を使わないほうが分かりやすい場面では、無理に使わなくて構いません。',
-  '- 与えられた情報に書かれていないことは推測で断定せず、',
-  '  「登録された解説にはここまでしか書かれていません」と正直に述べてください。',
+  '- 与えられた情報に書かれていないことは、推測で断定しないでください。',
+  '  確かに言えることだけを書き、足りないところを想像で埋めないでください。',
+  '  そのうえで、「登録された解説にはここまでしか書かれていません」のような、',
+  '  アプリの内部事情を説明することばは書かないでください。学習者には関係がありません。',
   '- 画像が渡された場合は、その画像に実際に写っているものだけを根拠にしてください。',
   '',
   '書き方（表示側はプレーンテキストなので、記法はそのまま文字として出てしまいます）:',
@@ -1067,6 +1106,9 @@ function getAiExplanation(request) {
         truncated: cached.truncated === true,
         cached: true,
         source: 'memory',
+        fallback_used: false,
+        notice_code: '',
+        notice: '',
         disclaimer: AI_DISCLAIMER
       };
     }
@@ -1106,6 +1148,9 @@ function getAiExplanation(request) {
         cached: true,
         source: 'sheet',
         generated_at: String(stored.generated_at || ''),
+        fallback_used: false,
+        notice_code: '',
+        notice: '',
         disclaimer: AI_DISCLAIMER
       };
     }
@@ -1120,10 +1165,13 @@ function getAiExplanation(request) {
     );
   }
 
-  const model = String(properties.getProperty(AI_CONFIG.MODEL_PROPERTY) || '').trim() || AI_CONFIG.DEFAULT_MODEL;
   const parts = buildAiPromptParts_(found.attempt, found.question);
-  const generated = callGeminiGenerateContent_(model, apiKey, parts);
+  // どのモデルで作るか（主モデル／予備モデル）はここで決める。
+  // 1日ぶんの枠を使い切っているモデルは、そもそも呼ばずに飛ばす。
+  const generated = callGeminiWithFallback_(properties, apiKey, parts);
   if (!generated.ok) return generated;
+
+  const model = String(generated.model || '');
 
   // 途中で切れた解説を残すと、次からずっと切れたものが再表示される。
   // 切れたときはどこにも残さず、「もう一度作る」で作り直せるようにする。
@@ -1140,6 +1188,9 @@ function getAiExplanation(request) {
     truncated: generated.truncated === true,
     cached: false,
     source: 'generated',
+    fallback_used: generated.fallback_used === true,
+    notice_code: String(generated.notice_code || ''),
+    notice: String(generated.notice || ''),
     disclaimer: AI_DISCLAIMER
   };
 }
@@ -1190,17 +1241,57 @@ function aiSheet_(createIfMissing) {
   try {
     const ss = spreadsheet_();
     let sh = ss.getSheetByName(AI_CONFIG.SHEET);
-    if (sh) return sh;
+    // 読むだけのときは表に触らない。書き込む前にだけ、足りない列を補う。
+    if (sh) return createIfMissing ? aiEnsureSheetColumns_(sh) : sh;
     if (!createIfMissing) return null;
 
     // 既存のシートの並びを崩さないよう、いちばん右へ足す。
     sh = ss.insertSheet(AI_CONFIG.SHEET, ss.getNumSheets());
-    sh.getRange(1, 1, 1, AI_CONFIG.SHEET_HEADERS.length).setValues([AI_CONFIG.SHEET_HEADERS.slice()]);
+    // 見出しは列をそろえる処理に任せる（作りたてでも、途中で列が増えても同じ道を通す）。
+    aiEnsureSheetColumns_(sh);
     sh.setFrozenRows(1);
     return sh;
   } catch (e) {
     return null;
   }
+}
+
+/**
+ * 使っている表の見出しを、いまの列構成へそろえる。
+ *
+ * prompt_version の列を後から足したときに、すでにある表を壊さないための処理。
+ * すること: 足りない列を増やし、空の見出しだけを書く。
+ * しないこと: すでに入っている値や、人が付け替えた見出しを書き換えること。
+ * うまくいかなくても止まらない（書き込み側が「今ある列ぶんだけ」書くため）。
+ */
+function aiEnsureSheetColumns_(sh) {
+  try {
+    const needed = AI_CONFIG.SHEET_HEADERS.length;
+    const maxColumns = sh.getMaxColumns();
+    if (maxColumns < needed) sh.insertColumnsAfter(maxColumns, needed - maxColumns);
+
+    const header = sh.getRange(1, 1, 1, needed).getValues()[0];
+    for (let i = 0; i < needed; i++) {
+      if (String(header[i] || '').trim() === '') {
+        sh.getRange(1, i + 1).setValue(AI_CONFIG.SHEET_HEADERS[i]);
+      }
+    }
+  } catch (e) {
+    // 列を足せなくても、これまでの列だけで動く。
+  }
+  return sh;
+}
+
+/**
+ * 残してある解説を、そのまま出してよいか。
+ *
+ * いまは常に「よい」。prompt_version は記録用の印で、判定には使わない。
+ * ＝この改修で、すでに残っている解説が無効になることはない。
+ * 将来、書き方を変えて作り直させたいときだけ RETIRED_PROMPT_VERSIONS へ古い版を並べる。
+ */
+function aiPromptVersionIsUsable_(version) {
+  const retired = AI_CONFIG.RETIRED_PROMPT_VERSIONS || [];
+  return retired.indexOf(String(version || '')) === -1;
 }
 
 /**
@@ -1228,10 +1319,24 @@ function aiSheetLookup_(questionId, userAnswer, signature) {
       if (String(keys[i][2]) !== String(signature)) continue;
 
       const row = i + 2;
-      const rest = sh.getRange(row, 4, 1, 3).getValues()[0];
+      /*
+       * 読む幅は「今ある列」に合わせる。
+       * prompt_version を足す前に作られた6列の表を読んでも、はみ出して失敗しない。
+       * （ここで失敗すると全部が作り直しになり、API使用量が跳ね上がる）
+       */
+      const width = Math.max(3, Math.min(AI_CONFIG.SHEET_HEADERS.length, sh.getLastColumn()) - 3);
+      const rest = sh.getRange(row, 4, 1, width).getValues()[0];
       const text = String(rest[2] || '');
       if (!text) return null;
-      return { model: String(rest[0] || ''), generated_at: formatMaybeDate_(rest[1]), text: text, row: row };
+      const promptVersion = width >= 4 ? String(rest[3] || '') : '';
+      if (!aiPromptVersionIsUsable_(promptVersion)) return null;
+      return {
+        model: String(rest[0] || ''),
+        generated_at: formatMaybeDate_(rest[1]),
+        text: text,
+        prompt_version: promptVersion,
+        row: row
+      };
     }
     return null;
   } catch (e) {
@@ -1264,9 +1369,10 @@ function aiSheetSave_(questionId, userAnswer, signature, model, text) {
     }
     if (!target) target = lastRow + 1;
 
-    sh.getRange(target, 1, 1, AI_CONFIG.SHEET_HEADERS.length).setValues([[
-      questionId, userAnswer, signature, model, new Date(), text
-    ]]);
+    // 列を足せなかった表でも書けるよう、今ある列の数までに切り詰めて書く。
+    const row = [questionId, userAnswer, signature, model, new Date(), text, AI_CONFIG.PROMPT_VERSION];
+    const width = Math.max(6, Math.min(AI_CONFIG.SHEET_HEADERS.length, sh.getMaxColumns()));
+    sh.getRange(target, 1, 1, width).setValues([row.slice(0, width)]);
     sh.getRange(target, 5).setNumberFormat('yyyy-mm-dd hh:mm:ss');
   } catch (e) {
     // 残せなくても、次に開いたとき作り直せばよい。
@@ -1417,6 +1523,277 @@ function aiInlineDataFromDataUrl_(dataUrl) {
   return { inline_data: { mime_type: match[1], data: match[2] } };
 }
 
+/* ------------- 主モデルと予備モデルの使い分け（AI解説だけの話） -------------
+ *
+ * 役割の境界（ここを越えない）:
+ * - 決めるのは「どのモデルへ頼むか」「今日はもう頼まないか」だけ。
+ * - 採点・理解度・学習ログ・出題には一切関わらない。
+ * - どのモデルも使えないときは、AI補助解説だけを止める。学習は止めない。
+ *
+ * 使い分けの考え方:
+ *   1. まず主モデル（既定は gemini-3.5-flash）へ頼む。
+ *   2. 主モデルが「1日ぶんの回数を使い切った」と答えた日だけ、予備モデルへ回す。
+ *   3. 1分あたりの混雑（すぐ直る）では、モデルを切り替えない。待てば直るため。
+ *   4. どちらも1日ぶんを使い切っていたら、APIを呼ばずにAI解説だけ止める。
+ */
+
+/** スクリプトプロパティからモデル名を読む。空なら既定値。 */
+function aiModelName_(properties, propertyName, defaultName) {
+  try {
+    return String(properties.getProperty(propertyName) || '').trim() || defaultName;
+  } catch (e) {
+    return defaultName;
+  }
+}
+
+/** 予備モデルを使ってよいか。既定は「使う」。 */
+function aiFallbackEnabled_(properties) {
+  let raw = '';
+  try {
+    raw = String(properties.getProperty(AI_CONFIG.FALLBACK_ENABLED_PROPERTY) || '').trim().toLowerCase();
+  } catch (e) {
+    return true;
+  }
+  if (!raw) return true;
+  return !(raw === 'false' || raw === 'no' || raw === 'off' || raw === '0');
+}
+
+/** 「今日ぶんを使い切ったモデル」の記録を読む。壊れていたら空として扱う。 */
+function aiQuotaBlockState_(properties) {
+  try {
+    const raw = properties.getProperty(AI_CONFIG.QUOTA_STATE_PROPERTY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return (parsed && typeof parsed === 'object') ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+/** そのモデルが今この瞬間、使えない状態か。 */
+function aiModelIsBlocked_(state, model, now) {
+  const until = Number((state || {})[model] || 0);
+  if (!until) return false;
+  // 壊れた値で永久に止まらないよう、上限を超えるものは無効にする。
+  if (until > now.getTime() + AI_CONFIG.MAX_QUOTA_BLOCK_SECONDS * 1000) return false;
+  return until > now.getTime();
+}
+
+/** 「このモデルは解除時刻まで使えない」を記録する。期限切れのぶんは掃除する。 */
+function aiRememberQuotaBlock_(properties, model, until) {
+  try {
+    const state = aiQuotaBlockState_(properties);
+    const now = Date.now();
+    Object.keys(state).forEach(key => {
+      if (!(Number(state[key]) > now)) delete state[key];
+    });
+    state[model] = until.getTime();
+    properties.setProperty(AI_CONFIG.QUOTA_STATE_PROPERTY, JSON.stringify(state));
+  } catch (e) {
+    // 覚えられなくても動作は変わらない（次も主モデルから試すだけ）。
+    console.warn('[AI] 利用枠の状態を保存できませんでした: ' + model);
+  }
+}
+
+/**
+ * 1日ぶんの枠が戻る時刻。
+ *
+ * Geminiの日次枠は日本時間の0時ではなく、米国太平洋時間の0時に戻る。
+ * 夏時間の有無は Utilities.formatDate がタイムゾーン名から判断するので、
+ * こちらで夏時間の計算をする必要はない。
+ * （切り替えの当日だけ最大1時間ずれるが、早ければ1回試して再び止まるだけ、
+ *   遅ければ1時間長く予備モデルを使うだけで、学習は止まらない）
+ */
+function aiNextQuotaResetAt_(now, timezone) {
+  try {
+    const parts = String(Utilities.formatDate(now, timezone, 'HH:mm:ss')).split(':').map(Number);
+    const elapsed = (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
+    const remaining = Math.min(Math.max(86400 - elapsed, 60), AI_CONFIG.MAX_QUOTA_BLOCK_SECONDS);
+    return new Date(now.getTime() + remaining * 1000);
+  } catch (e) {
+    // タイムゾーンを扱えないときは、長く止めすぎないよう1時間だけにする。
+    return new Date(now.getTime() + 3600 * 1000);
+  }
+}
+
+/** "44s" や "1.5s" のような待ち時間を秒に直す。読めなければ0。 */
+function aiParseRetrySeconds_(value) {
+  const match = String(value == null ? '' : value).match(/^([0-9]+(?:\.[0-9]+)?)s$/);
+  if (!match) return 0;
+  const seconds = Number(match[1]);
+  return isFinite(seconds) && seconds > 0 ? seconds : 0;
+}
+
+/**
+ * 429（利用上限）の中身を読み分ける。
+ *
+ * 同じ429でも、
+ *   - 1日ぶんを使い切った（今日はもう回復しない）
+ *   - 1分あたりの上限（少し待てば直る）
+ * では、とるべき行動がまったく違う。
+ * Geminiは details に QuotaFailure（どの枠か）と RetryInfo（どれだけ待つか）を返すので、
+ * 文字列ひとつではなく、この2つを合わせて判断する。
+ *
+ * 戻り値: { scope: 'daily' | 'short' | 'unknown', retry_seconds: 数値 }
+ */
+function aiClassifyQuotaError_(rawBody) {
+  const result = { scope: 'unknown', retry_seconds: 0 };
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(String(rawBody || ''));
+  } catch (e) {
+    parsed = null;
+  }
+
+  const error = (parsed && parsed.error) || {};
+  let daily = false;
+  let short = false;
+
+  (error.details || []).forEach(detail => {
+    if (!detail || typeof detail !== 'object') return;
+    const type = String(detail['@type'] || '');
+
+    if (type.indexOf('QuotaFailure') !== -1) {
+      (detail.violations || []).forEach(violation => {
+        const label = String((violation && violation.quotaId) || '') + ' ' +
+                      String((violation && violation.quotaMetric) || '');
+        if (/per\s*day|perday|daily/i.test(label)) daily = true;
+        else if (/per\s*minute|perminute|per\s*second|persecond/i.test(label)) short = true;
+      });
+    }
+
+    if (type.indexOf('RetryInfo') !== -1) {
+      const seconds = aiParseRetrySeconds_(detail.retryDelay);
+      if (seconds > 0) result.retry_seconds = seconds;
+    }
+  });
+
+  // details が付かない場合の保険。ここだけに頼らず、上の判定を優先する。
+  const message = String(error.message || '');
+  if (!daily && /per\s*day|daily\s*limit|1日/i.test(message)) daily = true;
+  if (!daily && !short && /per\s*minute|per\s*second/i.test(message)) short = true;
+
+  if (daily) result.scope = 'daily';
+  else if (short) result.scope = 'short';
+
+  // 枠の名前が読めなくても、「長く待て」と言われたら1日ぶんの枯渇とみなす。
+  if (result.scope !== 'daily' && result.retry_seconds >= AI_CONFIG.LONG_RETRY_SECONDS) {
+    result.scope = 'daily';
+  }
+  // 逆に短い待ち時間なら、混雑しているだけ。
+  if (result.scope === 'unknown' && result.retry_seconds > 0) {
+    result.scope = 'short';
+  }
+
+  return result;
+}
+
+/** 予備モデルへ切り替えたときに画面へ出す一言。 */
+const AI_FALLBACK_NOTICE =
+  '本日の高精度AIの枠を使い切ったため、軽量AIで解説しています。' +
+  '採点・理解度・学習記録には影響しません。';
+
+/** どのモデルも使えないときの案内（Googleの英語メッセージは画面へ出さない）。 */
+const AI_QUOTA_STOP_MESSAGE =
+  '本日のAI補助解説の枠を使い切りました。' +
+  '登録済みの解説・採点・理解度・学習記録は、これまでどおり使えます。' +
+  '枠は米国太平洋時間の0時（日本時間の夕方ごろ）に戻ります。';
+
+/** 混雑しているだけのときの案内。 */
+const AI_RATE_LIMIT_MESSAGE =
+  'AIへのアクセスが一時的に集中しています。1分ほど待ってから、もう一度お試しください。';
+
+/**
+ * 主モデル→（1日ぶんの枯渇時だけ）予備モデル、の順でAI解説を作る。
+ *
+ * 呼び出し回数は多くても2回（主モデル1回＋予備モデル1回）。
+ * 同じモデルへの自動やり直しはしない（使い切った日に空振りを増やさないため）。
+ */
+function callGeminiWithFallback_(properties, apiKey, parts) {
+  const now = new Date();
+  const blocked = aiQuotaBlockState_(properties);
+  const timezone = aiModelName_(
+    properties, AI_CONFIG.QUOTA_RESET_TIMEZONE_PROPERTY, AI_CONFIG.DEFAULT_QUOTA_RESET_TIMEZONE);
+
+  const primary = aiModelName_(properties, AI_CONFIG.MODEL_PROPERTY, AI_CONFIG.DEFAULT_MODEL);
+  const fallback = aiFallbackEnabled_(properties)
+    ? aiModelName_(properties, AI_CONFIG.FALLBACK_MODEL_PROPERTY, AI_CONFIG.DEFAULT_FALLBACK_MODEL)
+    : '';
+
+  // 今日ぶんを使い切っていると分かっているモデルは、最初から呼ばない。
+  const plan = [];
+  if (!aiModelIsBlocked_(blocked, primary, now)) plan.push({ model: primary, role: 'primary' });
+  if (fallback && fallback !== primary && !aiModelIsBlocked_(blocked, fallback, now)) {
+    plan.push({ model: fallback, role: 'fallback' });
+  }
+
+  if (!plan.length) {
+    console.log('[AI] 利用枠切れのため呼び出しを行いませんでした: ' + primary + ' / ' + (fallback || 'なし'));
+    return aiFailure_('AI_DAILY_QUOTA_EXHAUSTED', AI_QUOTA_STOP_MESSAGE);
+  }
+
+  let last = null;
+  for (let i = 0; i < plan.length; i++) {
+    const step = plan[i];
+    const result = callGeminiGenerateContent_(step.model, apiKey, parts);
+
+    if (result.ok) {
+      console.log('[AI] 生成しました: model=' + step.model + ' / 役割=' + step.role);
+      return {
+        ok: true,
+        text: result.text,
+        truncated: result.truncated === true,
+        model: step.model,
+        model_role: step.role,
+        fallback_used: step.role === 'fallback',
+        notice_code: step.role === 'fallback' ? 'AI_FALLBACK_MODEL' : '',
+        notice: step.role === 'fallback' ? AI_FALLBACK_NOTICE : ''
+      };
+    }
+
+    last = result;
+    const scope = String(result.quota_scope || '');
+    console.warn('[AI] 失敗: model=' + step.model + ' / code=' + result.error_code +
+                 (scope ? ' / 枠=' + scope : ''));
+
+    if (scope === 'daily') {
+      // 今日はこのモデルを呼ばない。次の問題からは、この記録を見て予備モデルへ直行する。
+      const until = aiQuotaResetAt_(now, timezone, result.retry_seconds);
+      aiRememberQuotaBlock_(properties, step.model, until);
+      continue;
+    }
+
+    if (scope === 'unknown') {
+      // 枠の種類が読み取れない429。記録は残さず、この1回だけ次のモデルを試す。
+      continue;
+    }
+
+    // 混雑（scope === 'short'）や設定の誤りでは、モデルを切り替えても直らない。
+    return result;
+  }
+
+  // 使えるモデルが尽きた。ここから先はAI解説だけを止める。
+  if (last && String(last.quota_scope || '')) {
+    return aiFailure_('AI_DAILY_QUOTA_EXHAUSTED', AI_QUOTA_STOP_MESSAGE);
+  }
+  return last;
+}
+
+/**
+ * いつまでこのモデルを休ませるか。
+ * Googleが「これだけ待て」と返していて、それが日次の戻り時刻より早ければそちらを使う。
+ */
+function aiQuotaResetAt_(now, timezone, retrySeconds) {
+  const daily = aiNextQuotaResetAt_(now, timezone);
+  const seconds = Number(retrySeconds || 0);
+  if (seconds > 0) {
+    const fromApi = new Date(now.getTime() + seconds * 1000);
+    if (fromApi.getTime() < daily.getTime()) return fromApi;
+  }
+  return daily;
+}
+
 /**
  * Gemini API をApps Scriptサーバー側から呼ぶ。
  * キーは x-goog-api-key ヘッダーで送り、URLにもレスポンスにも残さない。
@@ -1475,7 +1852,19 @@ function callGeminiGenerateContent_(model, apiKey, parts) {
     return aiFailure_('AI_MODEL_NOT_FOUND', 'モデルを利用できませんでした。GEMINI_MODEL の設定を確認してください。' + apiDetail);
   }
   if (status === 429) {
-    return aiFailure_('AI_RATE_LIMITED', 'AIの利用上限に達しました。少し時間をおいてからお試しください。' + apiDetail);
+    /*
+     * 同じ429でも「今日ぶんを使い切った」と「今この瞬間だけ混んでいる」は別物。
+     * どちらかを呼び出し側（callGeminiWithFallback_）が判断できるよう、
+     * 種類と待ち時間を添えて返す。
+     * Googleの長い英語メッセージは記録には残すが、画面には出さない。
+     */
+    const quota = aiClassifyQuotaError_(rawBody);
+    const failure = quota.scope === 'short'
+      ? aiFailure_('AI_RATE_LIMITED', AI_RATE_LIMIT_MESSAGE)
+      : aiFailure_('AI_DAILY_QUOTA_EXHAUSTED', AI_QUOTA_STOP_MESSAGE);
+    failure.quota_scope = quota.scope;
+    failure.retry_seconds = quota.retry_seconds;
+    return failure;
   }
   if (status < 200 || status >= 300) {
     return aiFailure_('AI_HTTP_ERROR', 'AIサービスがエラーを返しました（HTTP ' + status + '）。' + apiDetail);
@@ -1686,7 +2075,7 @@ function aiDetailSuffix_(detail) {
 function checkAiSetup() {
   const properties = PropertiesService.getScriptProperties();
   const apiKey = properties.getProperty(AI_CONFIG.API_KEY_PROPERTY);
-  const model = String(properties.getProperty(AI_CONFIG.MODEL_PROPERTY) || '').trim() || AI_CONFIG.DEFAULT_MODEL;
+  const model = aiModelName_(properties, AI_CONFIG.MODEL_PROPERTY, AI_CONFIG.DEFAULT_MODEL);
 
   if (!apiKey) {
     console.error('GEMINI_API_KEY がスクリプトプロパティに登録されていません。');
@@ -1694,7 +2083,11 @@ function checkAiSetup() {
   }
   // 鍵そのものは出さず、登録されている事実だけを記録する。
   console.log('GEMINI_API_KEY: 登録済み（' + String(apiKey).length + '文字）');
-  console.log('GEMINI_MODEL: ' + model);
+  console.log('GEMINI_MODEL（主）: ' + model);
+  console.log('GEMINI_FALLBACK_MODEL（予備）: ' + (aiFallbackEnabled_(properties)
+    ? aiModelName_(properties, AI_CONFIG.FALLBACK_MODEL_PROPERTY, AI_CONFIG.DEFAULT_FALLBACK_MODEL)
+    : '使わない設定'));
+  checkAiQuotaStatus();
 
   const result = callGeminiGenerateContent_(model, apiKey, [{ text: '接続確認です。「OK」とだけ返してください。' }]);
   if (result.ok) {
@@ -1703,6 +2096,41 @@ function checkAiSetup() {
     console.error('Gemini への接続に失敗しました: ' + result.error_code + ' / ' + result.message);
   }
   return result;
+}
+
+/**
+ * 「今日ぶんの枠を使い切った」と記録されているモデルを確認する。
+ *
+ * Apps Scriptエディタの「実行」から呼ぶと、実行ログに状態が出る。
+ * 学習データにも07_AI解説キャッシュにも触れない（読むのはスクリプトプロパティだけ）。
+ */
+function checkAiQuotaStatus() {
+  const properties = PropertiesService.getScriptProperties();
+  const state = aiQuotaBlockState_(properties);
+  const now = new Date();
+  const blocked = Object.keys(state).filter(model => aiModelIsBlocked_(state, model, now));
+
+  if (!blocked.length) {
+    console.log('AI利用枠: 制限中のモデルはありません。');
+    return { ok: true, blocked: [] };
+  }
+
+  const rows = blocked.map(model => ({
+    model: model,
+    until: formatDateTime_(new Date(Number(state[model])))
+  }));
+  rows.forEach(row => console.log('AI利用枠: ' + row.model + ' は ' + row.until + '（日本時間）まで休止中'));
+  return { ok: true, blocked: rows };
+}
+
+/**
+ * 休止の記録を消して、次の1回からもう一度そのモデルを試せるようにする。
+ * 枠が戻ったのに休止が続いているように見えるときの手当て。
+ */
+function clearAiQuotaBlock() {
+  PropertiesService.getScriptProperties().deleteProperty(AI_CONFIG.QUOTA_STATE_PROPERTY);
+  console.log('AI利用枠の休止記録を消しました。次の1回から主モデルを試します。');
+  return { ok: true };
 }
 
 /* ----------------------------- internal helpers ----------------------------- */
