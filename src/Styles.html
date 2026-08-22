@@ -298,6 +298,11 @@ button { touch-action: manipulation; }
 .ai-title { margin: 0; font-size: 16px; }
 .ai-note { margin: 6px 0 12px; font-size: 13px; color: var(--muted); }
 .ai-status { margin: 10px 0 0; font-size: 13px; }
+/* 予備モデルへ切り替えたときなどの短い案内。読み飛ばせるよう控えめにする。 */
+.ai-notice {
+  margin: 10px 0 0; padding: 8px 10px; font-size: 13px; line-height: 1.6;
+  border: 1px solid var(--line); border-radius: 10px; background: #fff8e6;
+}
 /*
   解説は長さが決まらない。高さを固定すると必ずどこかで見切れるので、
   高さは中身に任せ、横に長い語（URLや長いLaTeXの残骸）だけを折り返す。

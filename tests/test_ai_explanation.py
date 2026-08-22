@@ -96,7 +96,10 @@ class TestAiRequiresAnsweredAttempt(unittest.TestCase):
     def test_attempt_is_verified_before_calling_gemini(self):
         body = strip_literals(function_body(read('Code.gs'), 'getAiExplanation'))
         check = body.find('readAnsweredAttempt_(')
-        call = body.find('callGeminiGenerateContent_(')
+        # 主モデル／予備モデルの使い分けを別の関数へ出したので、
+        # 「Geminiを呼ぶ入口」は callGemini... で始まる呼び出しすべてを見る。
+        gemini = re.search(r'callGemini\w*\(', body)
+        call = gemini.start() if gemini else -1
         key = body.find('getProperty(')
         self.assertNotEqual(check, -1, '回答記録の確認を行っていません')
         self.assertNotEqual(call, -1, 'Gemini呼び出しが見つかりません')
@@ -265,13 +268,27 @@ class TestGeminiCall(unittest.TestCase):
                       'モデル名のスクリプトプロパティ名が違います')
         self.assertIn("DEFAULT_MODEL: 'gemini-3.5-flash'", code,
                       '既定モデルが gemini-3.5-flash ではありません')
+        self.assertIn("FALLBACK_MODEL_PROPERTY: 'GEMINI_FALLBACK_MODEL'", code,
+                      '予備モデルのスクリプトプロパティ名がありません')
+        self.assertIn("DEFAULT_FALLBACK_MODEL: 'gemini-3.5-flash-lite'", code,
+                      '既定の予備モデルが gemini-3.5-flash-lite ではありません')
 
-        body = strip_comments(function_body(read('Code.gs'), 'getAiExplanation'))
+        # どのモデルを使うかは、主モデル／予備モデルを選ぶ関数が決める。
+        body = strip_comments(function_body(read('Code.gs'), 'callGeminiWithFallback_'))
         self.assertRegex(
             body,
-            r'getProperty\(\s*AI_CONFIG\.MODEL_PROPERTY\s*\)[\s\S]{0,120}?AI_CONFIG\.DEFAULT_MODEL',
+            r'AI_CONFIG\.MODEL_PROPERTY[\s\S]{0,120}?AI_CONFIG\.DEFAULT_MODEL',
             'GEMINI_MODEL 未設定時に既定モデルへ落ちていません',
         )
+        self.assertRegex(
+            body,
+            r'AI_CONFIG\.FALLBACK_MODEL_PROPERTY[\s\S]{0,140}?AI_CONFIG\.DEFAULT_FALLBACK_MODEL',
+            'GEMINI_FALLBACK_MODEL 未設定時に既定の予備モデルへ落ちていません',
+        )
+
+        picker = strip_comments(function_body(read('Code.gs'), 'aiModelName_'))
+        self.assertIn('getProperty(', picker,
+                      'モデル名をスクリプトプロパティから読んでいません')
 
     def test_endpoint_is_the_official_gemini_api(self):
         code = strip_comments(read('Code.gs'))
@@ -445,9 +462,15 @@ class TestAiCaching(unittest.TestCase):
     def test_cache_is_checked_before_calling_gemini(self):
         body = strip_literals(function_body(read('Code.gs'), 'getAiExplanation'))
         cache = body.find('aiCacheGet_(')
-        call = body.find('callGeminiGenerateContent_(')
+        gemini = re.search(r'callGemini\w*\(', body)
+        call = gemini.start() if gemini else -1
         self.assertNotEqual(cache, -1, 'キャッシュを読んでいません')
+        self.assertNotEqual(call, -1, 'Gemini呼び出しが見つかりません')
         self.assertLess(cache, call, 'キャッシュより先にAIを呼んでいます')
+
+        sheet = body.find('aiSheetLookup_(')
+        self.assertNotEqual(sheet, -1, '残してある解説を探していません')
+        self.assertLess(sheet, call, '残してある解説より先にAIを呼んでいます')
 
     def test_cache_key_is_per_attempt(self):
         body = strip_comments(function_body(read('Code.gs'), 'getAiExplanation'))

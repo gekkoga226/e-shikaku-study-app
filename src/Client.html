@@ -906,10 +906,22 @@
     const status = $('aiStatus');
     status.textContent = '';
     status.classList.add('hidden');
+    setAiNotice('');
 
     const btn = $('aiExplainBtn');
     btn.textContent = 'AIでさらに噛み砕く';
     btn.disabled = !state.attemptId;
+  }
+
+  /*
+   * サーバーからの短い案内（予備モデルで作ったときなど）を出す。
+   * Googleの英語のエラー文はここには来ない。サーバー側で日本語の一言に直している。
+   */
+  function setAiNotice(text) {
+    const el = $('aiNotice');
+    if (!el) return;
+    el.textContent = text || '';
+    el.classList.toggle('hidden', !text);
   }
 
   // AIはこのボタンを押したときだけ呼ぶ（毎問自動では呼ばない）。
@@ -1010,6 +1022,8 @@
       .withFailureHandler(err => {
         if (seq !== state.aiSeq) return;
         $('aiExplainBtn').disabled = false;
+        $('aiExplainBtn').textContent = 'AIでさらに噛み砕く';
+        setAiNotice('');
         $('aiStatus').textContent = (err && err.message)
           ? err.message
           : 'AI補助解説を取得できませんでした。採点と理解度の記録は正常です。';
@@ -1019,7 +1033,12 @@
 
   function setAiWaiting() {
     const status = $('aiStatus');
-    $('aiExplainBtn').disabled = true;
+    const btn = $('aiExplainBtn');
+    // 押した瞬間に無効化する（この関数はボタンの処理と同じ流れの中で呼ばれる）。
+    // スマホで「押す→反応を待つ→もう一度押す」が起きても、2回目は届かない。
+    btn.disabled = true;
+    btn.textContent = '生成中…';
+    setAiNotice('');
     status.textContent = 'AIが補助解説を作っています。少しお待ちください。';
     status.classList.remove('hidden');
   }
@@ -1030,12 +1049,16 @@
     btn.disabled = false;
 
     if (!res || !res.ok) {
+      // 失敗しても、採点・理解度・学習ログはすでに確定している。ここでは知らせるだけ。
+      btn.textContent = 'AIでさらに噛み砕く';
+      setAiNotice('');
       status.textContent = (res && res.message)
         ? res.message
         : 'AI補助解説を取得できませんでした。採点と理解度の記録は正常です。';
       return;
     }
 
+    setAiNotice(res.notice || '');
     status.textContent = 'モデル: ' + (res.model || '') +
       aiSourceLabel(res) +
       (res.truncated

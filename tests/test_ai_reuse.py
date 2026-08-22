@@ -58,7 +58,10 @@ let GEMINI_REPLY = { text: '生成された解説です。', truncated: false };
 
 function makeSheet(name, headers, rows) {
   const grid = [headers.slice()].concat(rows.map(r => r.slice()));
-  return {
+  // 実物のシートと同じく「今ある列の数」を持ち、その外側へは書けないようにする。
+  // （列を足さずに新しい列へ書こうとする実装を、ここで捕まえるため）
+  const size = { columns: headers.length };
+  const sheet = {
     _grid: grid,
     getName: () => name,
     getLastRow: () => {
@@ -67,12 +70,25 @@ function makeSheet(name, headers, rows) {
       }
       return 0;
     },
-    getLastColumn: () => headers.length,
+    getLastColumn: () => {
+      let last = 0;
+      grid.forEach(line => {
+        for (let c = 0; c < size.columns; c++) {
+          if (line && String(line[c] == null ? '' : line[c]) !== '') last = Math.max(last, c + 1);
+        }
+      });
+      return last;
+    },
     getMaxRows: () => grid.length,
+    getMaxColumns: () => size.columns,
+    insertColumnsAfter: (afterColumn, howMany) => { size.columns += howMany; },
     setFrozenRows: () => {},
     getRange(row, col, numRows, numCols) {
       numRows = numRows == null ? 1 : numRows;
       numCols = numCols == null ? 1 : numCols;
+      if (col + numCols - 1 > size.columns) {
+        throw new Error('範囲が列の数を超えています: ' + name + ' col=' + col + ' num=' + numCols);
+      }
       return {
         getValues() {
           READS.push({ sheet: name, row, col, numRows, numCols });
@@ -106,6 +122,7 @@ function makeSheet(name, headers, rows) {
       };
     }
   };
+  return sheet;
 }
 
 const SHEETS = {
