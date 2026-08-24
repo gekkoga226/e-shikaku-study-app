@@ -37,6 +37,25 @@
         <p id="unansweredNote" class="hint">
           まだ一度も正式回答していない問題だけを出します。回答済みの問題は混ざりません。
         </p>
+        <!--
+          ジャンル指定（弱点の集中演習）。
+          選ぶのは論点で、内部値は node_id、画面に出すのは topic。
+          「すべてのジャンル」を選んだときは、これまでどおり弱点優先で出題する。
+        -->
+        <div class="genre-picker">
+          <label class="genre-picker-label" for="genreSelect">出題ジャンル</label>
+          <select id="genreSelect" class="genre-select">
+            <option value="ALL">すべてのジャンル（弱点優先）</option>
+          </select>
+          <button id="genreQuizBtn" class="primary-btn big" type="button">
+            このジャンルから出題する
+          </button>
+          <p id="genrePickerNote" class="hint">
+            ジャンルを選ぶと、その論点を主題とする問題だけをランダムに出します
+            （同じ問題は、そのジャンルを一巡するまで繰り返しません）。
+          </p>
+        </div>
+
         <button id="genreBtn" class="secondary-btn" type="button">ジャンル別の弱点を見る</button>
       </div>
 

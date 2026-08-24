@@ -425,6 +425,8 @@ function clearGenreBreakdownCache_() {
     const cache = CacheService.getUserCache();
     cache.remove(GENRE_CACHE_KEY);
     cache.remove(GENRE_MISTAKE_CACHE_KEY);
+    // ジャンル選択肢に出している理解度も、次に開いたとき新しくなる。
+    cache.remove(GENRE_OPTIONS_CACHE_KEY);
   } catch (e) {}
 }
 
@@ -432,8 +434,12 @@ function clearGenreBreakdownCache_() {
  * request:
  * {
  *   mode: "learning" | "review" | "unanswered",
- *   excludeQuestionIds: ["..."]
+ *   excludeQuestionIds: ["..."],
+ *   nodeId: "DL-RNN" | "ALL" | 未指定,   // ジャンル指定（絞り込み条件。modeではない）
+ *   sessionId: "WEB-..."                 // ジャンル内の一巡を数えるためだけに使う
  * }
+ *
+ * nodeId が未指定・空・"ALL" のときは、これまでとまったく同じ経路を通る。
  */
 function getNextQuestion(request) {
   request = request || {};
@@ -442,6 +448,16 @@ function getNextQuestion(request) {
 
   const formal = readColumns_(APP_CONFIG.SHEETS.QUESTIONS, QUESTION_PICK_COLUMNS).filter(isFormalQuestion_);
   const logs = readColumns_(APP_CONFIG.SHEETS.LOG, LOG_PICK_COLUMNS);
+
+  /*
+   * ジャンル指定。読むシートも、候補に入れてよいかの条件（isFormalQuestion_）も
+   * ここまで完全に同じで、この先で primary_node_id による絞り込みが増えるだけ。
+   * 未指定・ALL のときは '' になり、以降は従来どおりの経路を通る。
+   */
+  const genreNodeId = normalizeGenreNodeId_(request.nodeId);
+  if (genreNodeId) {
+    return nextGenreQuestion_(formal, logs, genreNodeId, excludes, mode, request.sessionId);
+  }
 
   // 未回答モードは独立した出題経路。既存のPhase8優先ロジックには入らない。
   if (mode === 'unanswered') {
@@ -705,6 +721,312 @@ function clearUnansweredSummaryCache_() {
   } catch (e) {}
 }
 
+/* ------------------- ジャンル指定ランダム出題（弱点の集中演習） -------------------
+ *
+ * 役割の境界（ここを越えない）:
+ * - 変えるのは「問題の選び方」だけ。採点・理解度・04_学習ログ・AI補助解説には触れない。
+ * - APP_CONFIG.MODES へは追加しない。ジャンル指定は学習モードではなく絞り込み条件で、
+ *   04_学習ログ G列 mode は learning / review / unanswered のまま既存互換を保つ。
+ *   （U列の正式集計判定式が見ているのも G列なので、ここへ新しい値を足さない）
+ * - ジャンルの判定は 03_問題台帳 の primary_node_id だけで行う。
+ *   secondary_node_ids は見ない。補助論点で紐づいただけの別ジャンル問題を混ぜると、
+ *   「RNNを解きたいのにRNNではない問題ばかり出る」状態になるため。
+ * - 出題条件（verified / active / 本文と正解の有無 / 画像を用意できるか）は
+ *   既存の isFormalQuestion_ と imageSupportAllowsQuestionObject_ をそのまま通す。
+ *   ジャンルを指定したからといって品質フィルタを迂回しない。
+ * - ランダム選択はサーバー側で行う。候補一覧をクライアントへ送らない
+ *   （回答前のブラウザへ渡すのは、これまでどおり publicQuestion_ の1問ぶんだけ）。
+ * - ジャンルの判定にAIを使わない。AIが止まってもこの経路は最後まで動く。
+ */
+
+/** 「すべてのジャンル」を表す内部値。これが来たら絞り込みをしない＝既存動作。 */
+const GENRE_ALL_VALUE = 'ALL';
+
+const GENRE_OPTIONS_CACHE_KEY = 'genre_options_v1';
+const GENRE_OPTIONS_CACHE_SECONDS = 300;
+
+/*
+ * ジャンル選択肢の問題数を数えるために読む03_問題台帳の列。
+ * isFormalQuestion_ と同じ判定に必要な列＋primary_node_id だけに絞る
+ * （解説などの長い列を読むと、ホーム画面が返ってこなくなる）。
+ */
+const GENRE_OPTION_QUESTION_COLUMNS = Object.freeze([
+  'question_id', 'question_text', 'correct_option',
+  'primary_node_id', 'verification_status', 'active'
+]);
+
+/*
+ * 同じセッション中に出題済みの問題を覚えておくための場所。
+ * 覚えておくのは question_id だけで、正解も本文も入れない。
+ * 消えても「重複が出やすくなる」だけで、出題・採点・ログには影響しない。
+ */
+const GENRE_SERVED_CACHE_PREFIX = 'genre_served_v1:';
+const GENRE_SERVED_CACHE_SECONDS = 6 * 60 * 60; // CacheServiceの上限
+const GENRE_SERVED_MAX = 500;
+
+/**
+ * ホーム画面のジャンル選択肢を返す。
+ *
+ * 一覧はコードへ持たず、02_マインドマップ（既に読んでいる範囲）から作る。
+ * 画面へ出すのは技術IDではなく topic で、内部値だけ node_id を使う。
+ *
+ * 出すのは次を満たす論点だけ:
+ *   - progress_eligible = TRUE（readMindmapLeafNodes_ が既に絞っている葉ノード）
+ *   - 03_問題台帳に、いま正式出題できる問題が1問以上ある
+ */
+function getGenreOptions() {
+  const startedAt = Date.now();
+
+  const cached = readGenreOptionsCache_();
+  if (cached) return cached;
+
+  const counts = countFormalQuestionsByNode_();
+  const genres = readMindmapLeafNodes_()
+    .filter(node => numberOrZero_(counts[node.node_id]) > 0)
+    .map(node => ({
+      node_id: node.node_id,
+      topic: String(node.topic || node.node_id),
+      major_area: String(node.major_area || ''),
+      question_count: numberOrZero_(counts[node.node_id]),
+      mastery_pct: numberOrZero_(node.mastery_pct)
+    }))
+    .sort(compareGenreOptions_);
+
+  const data = {
+    ok: true,
+    genres: genres,
+    total_question_count: genres.reduce((sum, g) => sum + g.question_count, 0),
+    generatedAt: formatDateTime_(new Date())
+  };
+  writeGenreOptionsCache_(data);
+  logElapsed_('getGenreOptions', startedAt);
+  return data;
+}
+
+/**
+ * 論点ごとの「いま正式出題できる問題数」。
+ *
+ * 数え方は出題側とまったく同じ（isFormalQuestion_ ＋ primary_node_id）。
+ * 02_マインドマップの primary_verified_question_count ではなくここで数えるのは、
+ * 選択肢に出した問題数と、実際に出題される問題の集合をずらさないため。
+ */
+function countFormalQuestionsByNode_() {
+  const counts = {};
+  readColumns_(APP_CONFIG.SHEETS.QUESTIONS, GENRE_OPTION_QUESTION_COLUMNS)
+    .filter(isFormalQuestion_)
+    .forEach(q => {
+      const nodeId = String(q.primary_node_id || '');
+      if (!nodeId) return;
+      counts[nodeId] = (counts[nodeId] || 0) + 1;
+    });
+  return counts;
+}
+
+/** 大分類ごとにまとめ、その中では理解度が低い順（＝補強したい順）に並べる。 */
+function compareGenreOptions_(a, b) {
+  if (a.major_area !== b.major_area) return String(a.major_area).localeCompare(String(b.major_area));
+  if (a.mastery_pct !== b.mastery_pct) return a.mastery_pct - b.mastery_pct;
+  return String(a.node_id).localeCompare(String(b.node_id));
+}
+
+function readGenreOptionsCache_() {
+  try {
+    const raw = CacheService.getUserCache().get(GENRE_OPTIONS_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && Array.isArray(parsed.genres) ? parsed : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeGenreOptionsCache_(data) {
+  try {
+    CacheService.getUserCache().put(
+      GENRE_OPTIONS_CACHE_KEY, JSON.stringify(data), GENRE_OPTIONS_CACHE_SECONDS
+    );
+  } catch (e) {
+    // 使い回せなくても読み直せばよいので、失敗しても動作は変えない。
+  }
+}
+
+/**
+ * クライアントから届いたジャンル指定を、絞り込みに使える形へ直す。
+ * 空・未指定・ALL は「すべてのジャンル」＝絞り込みなし（既存動作のまま）。
+ * ここでは形を整えるだけで、実在するかどうかは nextGenreQuestion_ が確かめる。
+ */
+function normalizeGenreNodeId_(value) {
+  const raw = String(value == null ? '' : value).trim();
+  if (!raw) return '';
+  if (raw.toUpperCase() === GENRE_ALL_VALUE) return '';
+  return raw;
+}
+
+/**
+ * ジャンルを指定したときの出題。
+ *
+ * ここで行うのは「候補をそのジャンルへ絞ること」と「その中から1問選ぶこと」だけで、
+ * 候補に入れてよいかどうかの条件は既存のものをそのまま使う。
+ */
+function nextGenreQuestion_(formalQuestions, logs, nodeId, excludes, mode, sessionId) {
+  // クライアントの値をそのまま信じない。02_マインドマップに実在する論点だけを通す。
+  const node = readMindmapLeafNodes_().filter(n => n.node_id === nodeId)[0] || null;
+  if (!node) {
+    return {
+      ok: false,
+      reason: 'UNKNOWN_GENRE',
+      genre_node_id: nodeId,
+      message: '指定されたジャンルが見つかりませんでした。ホームでジャンルを選び直してください。'
+    };
+  }
+
+  // ジャンルの判定は primary_node_id だけ。secondary_node_ids では拾わない。
+  const candidates = formalQuestions.filter(q => String(q.primary_node_id || '') === nodeId);
+  if (!candidates.length) {
+    return decorateGenrePayload_({
+      ok: false,
+      reason: 'NO_QUESTION_IN_GENRE',
+      message: 'このジャンルには現在出題できる問題がありません。'
+    }, node);
+  }
+
+  /*
+   * 未回答優先との組み合わせ。
+   *
+   * 絞ったあとの選び方は既存の未回答ロジックへそのまま渡すだけなので、
+   * 「ジャンル×未回答優先」は新しい判定を1つも足さずに成立する。
+   * いまの画面はここを使わないが、将来UIを足すときに実装を変えずに済む。
+   */
+  if (mode === 'unanswered') {
+    return decorateGenrePayload_(nextUnansweredQuestion_(candidates, logs, excludes), node);
+  }
+
+  return nextGenreRandomQuestion_(candidates, node, logs, excludes, mode, sessionId);
+}
+
+/**
+ * ジャンル内のランダム出題。
+ *
+ * 完全な毎回乱数ではなく「ランダムな順で一巡する」。
+ *   1. 候補のうち、このセッションでまだ出していないものを集める
+ *   2. その中からランダムに選ぶ
+ *   3. 出したものを覚えておく
+ *   4. 一巡したら覚えていたものを捨て、また全部を候補に戻す
+ * こうしないと、17問しかないジャンルで同じ問題が短い間に何度も出る。
+ */
+function nextGenreRandomQuestion_(candidates, node, logs, excludes, mode, sessionId) {
+  const servedKey = genreServedCacheKey_(sessionId, node.node_id);
+  const served = readGenreServed_(servedKey);
+
+  // このセッションでまだ出していない問題。直前に出した問題（excludes）も避ける。
+  const fresh = candidates.filter(
+    q => !served.has(String(q.question_id)) && !excludes.has(String(q.question_id))
+  );
+
+  let nextServed = served;
+  let picked = pickPlayableGenreQuestion_(fresh);
+
+  if (!picked) {
+    /*
+     * 一巡した（または残りが画像の都合でいま出せない）。
+     * 覚えていた出題済みを捨てて、もう一度全部を候補に戻す。
+     * 除外リストのほうが候補より多い小さなジャンルでも出題を止めないよう、
+     * 最後は除外も外して候補を組み直す。
+     */
+    nextServed = new Set();
+    picked = pickPlayableGenreQuestion_(
+      candidates.filter(q => !excludes.has(String(q.question_id)))
+    ) || pickPlayableGenreQuestion_(candidates);
+  }
+
+  if (!picked) {
+    // 画像が見えない状態で回答させない。既存の出題経路と同じ扱い。
+    return decorateGenrePayload_({
+      ok: false,
+      reason: 'NO_ELIGIBLE_QUESTION_IN_GENRE',
+      message: 'このジャンルの問題を、いまは表示できません。少し時間をおいてからお試しください。'
+    }, node);
+  }
+
+  nextServed.add(String(picked.question_id));
+  writeGenreServed_(servedKey, nextServed);
+
+  const latest = latestFormalLogByQuestion_(logs);
+  const payload = publicQuestion_(picked, node, mode, !!latest[String(picked.question_id)]);
+  payload.genre_candidate_count = candidates.length;
+  payload.genre_remaining_in_cycle = Math.max(0, candidates.length - nextServed.size);
+  return decorateGenrePayload_(payload, node);
+}
+
+/**
+ * 候補をランダムな順に並べ、いま表示できる（画像を用意できる）最初の1問を返す。
+ *
+ * 画像の点検は上から順に、必要なぶんだけ行う（既存の出題経路と同じ考え方）。
+ * 1問につきキャッシュ参照2回とSHA-256計算1回を伴うため、
+ * 候補全部にかけると1問出すたびに数百回の往復が発生する。
+ */
+function pickPlayableGenreQuestion_(candidates) {
+  if (!candidates || !candidates.length) return null;
+  const shuffled = shuffleForGenre_(candidates);
+  for (const candidate of shuffled) {
+    if (imageSupportAllowsQuestionObject_(candidate)) return candidate;
+  }
+  return null;
+}
+
+/** どのジャンルで出した1問なのかを画面へ伝える。正解に関わる値は足さない。 */
+function decorateGenrePayload_(payload, node) {
+  if (!payload || !node) return payload;
+  payload.genre_node_id = node.node_id;
+  payload.genre_topic = String(node.topic || '');
+  return payload;
+}
+
+/** Fisher-Yates。候補の並びに偏りを残さないため、先頭から順に入れ替える。 */
+function shuffleForGenre_(items) {
+  const out = items.slice();
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const swap = out[i];
+    out[i] = out[j];
+    out[j] = swap;
+  }
+  return out;
+}
+
+/**
+ * 出題済みを覚えておく場所の名前。
+ * セッションとジャンルごとに分ける（別のジャンルの一巡を巻き込まないため）。
+ * クライアントから来た文字列はそのまま鍵にせず、英数字だけへ落として長さも切る。
+ */
+function genreServedCacheKey_(sessionId, nodeId) {
+  const session = String(sessionId || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64) || 'nosession';
+  const node = String(nodeId || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64);
+  return GENRE_SERVED_CACHE_PREFIX + session + ':' + node;
+}
+
+function readGenreServed_(key) {
+  try {
+    const raw = CacheService.getUserCache().get(key);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return new Set(Array.isArray(parsed) ? parsed.map(String) : []);
+  } catch (e) {
+    // 覚えていられなくても出題は続く（重複が出やすくなるだけ）。
+    return new Set();
+  }
+}
+
+function writeGenreServed_(key, served) {
+  try {
+    const ids = [];
+    served.forEach(id => ids.push(String(id)));
+    CacheService.getUserCache().put(
+      key, JSON.stringify(ids.slice(-GENRE_SERVED_MAX)), GENRE_SERVED_CACHE_SECONDS
+    );
+  } catch (e) {
+    // 同上。書けなくても出題・採点・ログには影響しない。
+  }
+}
+
 function normalizeMode_(mode) {
   const value = String(mode || '').trim();
   return APP_CONFIG.MODES.indexOf(value) >= 0 ? value : 'learning';
@@ -932,6 +1254,23 @@ function runSelfTest() {
         + ' / 03_問題台帳の正式問題: ' + unanswered.formal_total + '）'
         + ' / 回答済み' + genre.totals.answered
         + '（未回答モードの数え方: ' + unanswered.answered_unique + '）'
+    );
+
+    /*
+     * ジャンル指定出題の選択肢（読むだけ。ログには書かない）。
+     *
+     * 出題できる問題が1問もないジャンルを選ばせないための確認。
+     * 数え方は出題側と同じ isFormalQuestion_ なので、合計は
+     * 03_問題台帳の正式問題数（primary_node_idが空の問題ぶんだけ少ない）と揃う。
+     */
+    const genreOptions = getGenreOptions();
+    push(
+      'Genre options',
+      genreOptions.genres.length > 0
+        && genreOptions.genres.every(g => g.question_count > 0 && !!g.topic)
+        && genreOptions.total_question_count <= unanswered.formal_total,
+      genreOptions.genres.length + 'ジャンル / 出題可能' + genreOptions.total_question_count
+        + '問（03_問題台帳の正式問題: ' + unanswered.formal_total + '）'
     );
 
     return {
