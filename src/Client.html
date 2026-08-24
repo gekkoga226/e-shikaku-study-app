@@ -15,6 +15,13 @@
     // 結果を読んでいるあいだに用意しておく次の1問（読み取りだけ・書き込みはしない）
     prefetch: null,
     prefetchKey: '',
+    /*
+     * ジャンル指定出題。
+     * genreNodeId は「いま解いているジャンル」で、'' なら すべてのジャンル＝既存動作。
+     * 選択肢の一覧はサーバー（02_マインドマップ）から受け取るだけで、画面には持たない。
+     */
+    genreNodeId: '',
+    genreOptions: null,
     // ジャンル別画面。表示するだけで、出題・採点・理解度には一切関わらない。
     genre: null,
     genreMistakes: null,
@@ -35,6 +42,8 @@
     $('startBtn').addEventListener('click', () => startLearning('learning'));
     $('reviewBtn').addEventListener('click', () => startLearning('review'));
     $('unansweredBtn').addEventListener('click', () => startLearning('unanswered'));
+    $('genreQuizBtn').addEventListener('click', startGenreQuiz);
+    $('genreSelect').addEventListener('change', updateGenreQuizButton);
     $('genreBtn').addEventListener('click', showGenreView);
     $('genreHomeBtn').addEventListener('click', showHome);
     $('genreMistakeBtn').addEventListener('click', loadGenreMistakes);
@@ -83,6 +92,9 @@
     // 残数の集計は03_問題台帳と04_学習ログを端から端まで読むため重い。
     // 理解度や弱点の表示を待たせないよう、別の呼び出しにして後から差し込む。
     loadUnansweredSummary();
+
+    // ジャンルの選択肢も別の呼び出しにする（読めなくても他の表示を止めない）。
+    loadGenreOptions();
   }
 
   function loadWeaknesses() {
@@ -418,10 +430,103 @@
     );
   }
 
+  /* ------------------------- ジャンル指定（弱点の集中演習） -------------------------
+   *
+   * 画面が持つのは「どのジャンルを選んだか」だけ。
+   * 候補問題も正解も、ここへは一切降りてこない（選ぶのはサーバー側）。
+   * 「すべてのジャンル」を選んだときは nodeId を送らず、これまでどおりの経路を通る。
+   */
+  const GENRE_ALL_VALUE = 'ALL';
+
+  function loadGenreOptions() {
+    const select = $('genreSelect');
+    select.disabled = true;
+    $('genreQuizBtn').disabled = true;
+
+    google.script.run
+      .withSuccessHandler(data => {
+        state.genreOptions = data && data.genres ? data.genres : [];
+        renderGenreOptions();
+      })
+      .withFailureHandler(() => {
+        // 一覧を読めなくても「すべてのジャンル」は選べる状態にしておく。
+        state.genreOptions = [];
+        renderGenreOptions();
+        $('genrePickerNote').textContent =
+          'ジャンル一覧を読み込めませんでした。すべてのジャンルからの出題は通常どおり行えます。';
+      })
+      .getGenreOptions();
+  }
+
+  // 選択肢は02_マインドマップの値をそのまま出す。ここで並べ替えや加工はしない。
+  function renderGenreOptions() {
+    const select = $('genreSelect');
+    // 開き直しても選んでいたジャンルが変わらないようにする。
+    const keep = state.genreNodeId || select.value || GENRE_ALL_VALUE;
+
+    select.innerHTML = '';
+    select.appendChild(genreOption(GENRE_ALL_VALUE, 'すべてのジャンル（弱点優先）'));
+
+    let group = null;
+    (state.genreOptions || []).forEach(g => {
+      const area = g.major_area || 'その他';
+      if (!group || group.label !== area) {
+        group = document.createElement('optgroup');
+        group.label = area;
+        select.appendChild(group);
+      }
+      group.appendChild(genreOption(g.node_id, genreOptionLabel(g)));
+    });
+
+    select.value = keep;
+    // 消えたジャンル（出題できる問題が0問になった等）を選んだままにしない。
+    if (!select.value) select.value = GENRE_ALL_VALUE;
+
+    select.disabled = false;
+    updateGenreQuizButton();
+  }
+
+  function genreOption(value, label) {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = label;
+    return opt;
+  }
+
+  // 画面へ出すのは技術IDではなく topic。内部値だけ node_id を使う。
+  function genreOptionLabel(g) {
+    const count = Number(g.question_count || 0);
+    return String(g.topic || g.node_id)
+      + '（' + count + '問・理解度' + Number(g.mastery_pct || 0) + '%）';
+  }
+
+  function selectedGenreNodeId() {
+    const value = $('genreSelect').value || GENRE_ALL_VALUE;
+    return value === GENRE_ALL_VALUE ? '' : value;
+  }
+
+  // 何が起きるボタンなのかを、選択に合わせて言い換える。
+  function updateGenreQuizButton() {
+    const nodeId = selectedGenreNodeId();
+    $('genreQuizBtn').disabled = false;
+    $('genreQuizBtn').textContent = nodeId
+      ? 'このジャンルからランダム出題'
+      : 'すべてのジャンルから出題する';
+  }
+
+  function startGenreQuiz() {
+    startLearning('learning', selectedGenreNodeId());
+  }
+
   const MODES = ['learning', 'review', 'unanswered'];
 
-  function startLearning(mode) {
+  /**
+   * 学習を始める。
+   * nodeId を渡すとそのジャンルだけを出題する。渡さないときは従来どおり。
+   */
+  function startLearning(mode, nodeId) {
     state.mode = MODES.indexOf(mode) >= 0 ? mode : 'learning';
+    state.genreNodeId = String(nodeId || '');
     state.excludeQuestionIds = [];
     state.failedQuestions.clear();
     clearPrefetch();
@@ -463,6 +568,14 @@
     $('loadingMessage').textContent = message;
   }
 
+  /*
+   * ジャンルを絞ったせいで出題できないときの理由。
+   * どれも「別のジャンルへ広げて出す」ことはせず、そのまま画面で伝える。
+   */
+  const GENRE_EMPTY_REASONS = [
+    'NO_QUESTION_IN_GENRE', 'NO_ELIGIBLE_QUESTION_IN_GENRE', 'UNKNOWN_GENRE'
+  ];
+
   function loadNextQuestion() {
     const seq = ++state.presentSeq;
     state.current = null;
@@ -493,6 +606,14 @@
             );
             return;
           }
+          // ジャンルを選んだのに出せる問題が無いとき。他のジャンルへ勝手に広げない。
+          if (q && GENRE_EMPTY_REASONS.indexOf(q.reason) >= 0) {
+            showQuestionNotice(
+              (q.genre_topic ? q.genre_topic + 'の' : '') + '問題を出題できません',
+              q.message || 'このジャンルには現在出題できる問題がありません。'
+            );
+            return;
+          }
           showQuestionNotice(
             'いま出せる問題がありません',
             (q && q.message) || '現在の条件に合う問題が見つかりませんでした。'
@@ -508,7 +629,11 @@
       })
       .getNextQuestion({
         mode: state.mode,
-        excludeQuestionIds: state.excludeQuestionIds
+        excludeQuestionIds: state.excludeQuestionIds,
+        // '' なら絞り込みなし＝これまでと同じ出題。
+        nodeId: state.genreNodeId,
+        // ジャンル内で一巡を数えるためだけに使う（採点にもログにも使わない）。
+        sessionId: state.sessionId
       });
   }
 
@@ -815,7 +940,7 @@
    * 成功したものだけを手元に残す（表示できない画像の問題を先読みで出さない）。
    */
   function prefetchKey() {
-    return state.mode + '|' + state.excludeQuestionIds.join(',');
+    return state.mode + '|' + state.genreNodeId + '|' + state.excludeQuestionIds.join(',');
   }
 
   function clearPrefetch() {
@@ -869,7 +994,9 @@
       .withFailureHandler(giveUp)
       .getNextQuestion({
         mode: state.mode,
-        excludeQuestionIds: state.excludeQuestionIds.slice()
+        excludeQuestionIds: state.excludeQuestionIds.slice(),
+        nodeId: state.genreNodeId,
+        sessionId: state.sessionId
       });
   }
 

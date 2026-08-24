@@ -392,10 +392,12 @@ class TestPrefetchFreshness(unittest.TestCase):
     def setUp(self):
         require_node(self)
 
-    def _take(self, prefetch_state, current_mode, excludes, failed=()):
+    def _take(self, prefetch_state, current_mode, excludes, failed=(), genre=''):
         script = '\n'.join([
             'const state = {',
             '  mode: %s,' % js_value(current_mode),
+            # ジャンル指定は先読みの条件のひとつ（'' なら すべてのジャンル）。
+            '  genreNodeId: %s,' % js_value(genre),
             '  excludeQuestionIds: %s,' % js_value(list(excludes)),
             '  failedQuestions: new Set(%s),' % js_value(list(failed)),
             '  prefetch: %s,' % js_value(prefetch_state),
@@ -412,24 +414,36 @@ class TestPrefetchFreshness(unittest.TestCase):
         return run(script)
 
     def test_prefetched_question_is_used_when_conditions_match(self):
-        ready = {'key': 'learning|Q1', 'question': {'question_id': 'Q2'}, 'bundle': {}}
+        ready = {'key': 'learning||Q1', 'question': {'question_id': 'Q2'}, 'bundle': {}}
         result = self._take(ready, 'learning', ['Q1'])
         self.assertEqual(result['taken'], 'Q2')
         self.assertFalse(result['leftOver'], '使ったあとも残っています')
 
     def test_prefetch_from_another_mode_is_discarded(self):
-        ready = {'key': 'learning|Q1', 'question': {'question_id': 'Q2'}, 'bundle': {}}
+        ready = {'key': 'learning||Q1', 'question': {'question_id': 'Q2'}, 'bundle': {}}
         result = self._take(ready, 'review', ['Q1'])
         self.assertIsNone(result['taken'], '別モードの先読みを使っています')
         self.assertFalse(result['leftOver'])
 
     def test_prefetch_with_a_stale_exclude_list_is_discarded(self):
-        ready = {'key': 'learning|Q1', 'question': {'question_id': 'Q2'}, 'bundle': {}}
+        ready = {'key': 'learning||Q1', 'question': {'question_id': 'Q2'}, 'bundle': {}}
         result = self._take(ready, 'learning', ['Q1', 'Q9'])
         self.assertIsNone(result['taken'], '古い除外リストの先読みを使っています')
 
+    def test_prefetch_from_another_genre_is_discarded(self):
+        """ジャンルを変えたら、前のジャンルで用意した問題は使わない。"""
+        ready = {'key': 'learning|DL-RNN|Q1', 'question': {'question_id': 'Q2'}, 'bundle': {}}
+        result = self._take(ready, 'learning', ['Q1'], genre='APP-NLP')
+        self.assertIsNone(result['taken'], '別ジャンルの先読みを使っています')
+        self.assertFalse(result['leftOver'])
+
+    def test_prefetch_within_the_same_genre_is_used(self):
+        ready = {'key': 'learning|DL-RNN|Q1', 'question': {'question_id': 'Q2'}, 'bundle': {}}
+        result = self._take(ready, 'learning', ['Q1'], genre='DL-RNN')
+        self.assertEqual(result['taken'], 'Q2')
+
     def test_prefetch_of_a_failed_image_question_is_discarded(self):
-        ready = {'key': 'learning|Q1', 'question': {'question_id': 'Q2'}, 'bundle': {}}
+        ready = {'key': 'learning||Q1', 'question': {'question_id': 'Q2'}, 'bundle': {}}
         result = self._take(ready, 'learning', ['Q1'], failed=['Q2'])
         self.assertIsNone(result['taken'],
                           '画像を表示できなかった問題を先読みから出しています')

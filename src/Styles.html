@@ -125,6 +125,37 @@ button { touch-action: manipulation; }
 .progress-track { grid-column: 1 / -1; height: 8px; background: #edf0f5; border-radius: 999px; overflow: hidden; }
 .progress-bar { height: 100%; background: var(--accent); border-radius: inherit; }
 /*
+  ジャンル指定（ホーム画面）。
+  スマホの縦画面が既定。セレクタもボタンも幅いっぱいの縦並びにして、
+  横スクロールも、指の届かない小さな当たり判定も作らない。
+*/
+.genre-picker {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--accent-soft);
+}
+.genre-picker-label { font-size: 13px; font-weight: 800; color: var(--muted); }
+.genre-select {
+  width: 100%;
+  max-width: 100%;
+  min-height: 48px;
+  padding: 10px 12px;
+  border: 1px solid #b7c7f5;
+  border-radius: 12px;
+  background: #fff;
+  color: var(--text);
+  font: inherit;
+  font-weight: 700;
+  /* 長い論点名でも枠を押し広げない（はみ出す前に…で切る） */
+  text-overflow: ellipsis;
+}
+.genre-select:disabled { opacity: .6; }
+.genre-picker .hint { margin-top: 2px; }
+
+/*
   ジャンル別の弱点。
   帯グラフは「最新正解 / 最新誤答 / 未回答」の3つを横に並べる。
   幅は % で与えるが、0%のときは要素ごと出さない（1pxの線が残らないように）。
@@ -329,6 +360,7 @@ button { touch-action: manipulation; }
   .question-image { max-height: 64vh; }
   .option-image { max-height: 46vh; }
   .confidence-options { grid-template-columns: 1fr; }
+  .genre-picker { padding: 12px; }
   .metric-value { font-size: 21px; }
 }
 </style>
