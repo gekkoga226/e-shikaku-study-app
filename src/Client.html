@@ -22,6 +22,11 @@
      */
     genreNodeId: '',
     genreOptions: null,
+    /*
+     * 出題方法（絞り込み条件）。'' なら既存の選び方、'mistakes' なら
+     * 間違えた問題・自信なしを優先。mode ではないので学習ログには入らない。
+     */
+    strategy: '',
     // ジャンル別画面。表示するだけで、出題・採点・理解度には一切関わらない。
     genre: null,
     genreMistakes: null,
@@ -42,8 +47,10 @@
     $('startBtn').addEventListener('click', () => startLearning('learning'));
     $('reviewBtn').addEventListener('click', () => startLearning('review'));
     $('unansweredBtn').addEventListener('click', () => startLearning('unanswered'));
+    $('mistakeBtn').addEventListener('click', () => startLearning('learning', '', 'mistakes'));
     $('genreQuizBtn').addEventListener('click', startGenreQuiz);
     $('genreSelect').addEventListener('change', updateGenreQuizButton);
+    $('strategySelect').addEventListener('change', updateGenreQuizButton);
     $('genreBtn').addEventListener('click', showGenreView);
     $('genreHomeBtn').addEventListener('click', showHome);
     $('genreMistakeBtn').addEventListener('click', loadGenreMistakes);
@@ -92,6 +99,9 @@
     // 残数の集計は03_問題台帳と04_学習ログを端から端まで読むため重い。
     // 理解度や弱点の表示を待たせないよう、別の呼び出しにして後から差し込む。
     loadUnansweredSummary();
+
+    // 復習したい問題の残数も、他の表示を待たせない別の呼び出しにする。
+    loadMistakeSummary();
 
     // ジャンルの選択肢も別の呼び出しにする（読めなくても他の表示を止めない）。
     loadGenreOptions();
@@ -151,6 +161,29 @@
     btn.textContent = remaining > 0
       ? '未回答問題を優先して解く（' + remaining + '問）'
       : '未回答問題を優先して解く（すべて解答済み）';
+  }
+
+  function loadMistakeSummary() {
+    $('mistakeBtn').textContent = '間違えた問題・自信なしを優先して解く（数えています…）';
+
+    google.script.run
+      .withSuccessHandler(renderMistakeButton)
+      .withFailureHandler(() => renderMistakeButton(null))
+      .getMistakeSummary();
+  }
+
+  // 残数はサーバー（＝04_学習ログのcounts_for_mastery）が数えた値をそのまま出す。
+  function renderMistakeButton(summary) {
+    const btn = $('mistakeBtn');
+    const total = summary ? Number(summary.total) : NaN;
+
+    if (!Number.isFinite(total)) {
+      btn.textContent = '間違えた問題・自信なしを優先して解く';
+      return;
+    }
+    btn.textContent = total > 0
+      ? '間違えた問題・自信なしを優先して解く（' + total + '問）'
+      : '間違えた問題・自信なしを優先して解く（対象なし）';
   }
 
   // ホーム画面での失敗は、問題画面用の表示では見えない。ここで理由を残す。
@@ -505,28 +538,49 @@
     return value === GENRE_ALL_VALUE ? '' : value;
   }
 
+  /*
+   * 出題方法の選択を、サーバーへ渡す形へ直す。
+   *
+   * 「未回答を優先」だけは既存の mode をそのまま使う（新しい mode を作らない）。
+   * 「間違えた問題・自信なし」は mode ではなく strategy として渡すので、
+   * 04_学習ログ G列 mode は learning のままになる。
+   */
+  function selectedStrategy() {
+    const value = $('strategySelect').value;
+    if (value === 'unanswered') return { mode: 'unanswered', strategy: '' };
+    if (value === 'mistakes') return { mode: 'learning', strategy: 'mistakes' };
+    return { mode: 'learning', strategy: '' };
+  }
+
   // 何が起きるボタンなのかを、選択に合わせて言い換える。
   function updateGenreQuizButton() {
     const nodeId = selectedGenreNodeId();
+    const where = nodeId ? 'このジャンル' : 'すべてのジャンル';
+    const how = $('strategySelect').value;
+    const label = how === 'mistakes'
+      ? 'の間違えた問題を解く'
+      : (how === 'unanswered' ? 'の未回答を解く' : nodeId ? 'からランダム出題' : 'から出題する');
+
     $('genreQuizBtn').disabled = false;
-    $('genreQuizBtn').textContent = nodeId
-      ? 'このジャンルからランダム出題'
-      : 'すべてのジャンルから出題する';
+    $('genreQuizBtn').textContent = where + label;
   }
 
   function startGenreQuiz() {
-    startLearning('learning', selectedGenreNodeId());
+    const how = selectedStrategy();
+    startLearning(how.mode, selectedGenreNodeId(), how.strategy);
   }
 
   const MODES = ['learning', 'review', 'unanswered'];
 
   /**
    * 学習を始める。
-   * nodeId を渡すとそのジャンルだけを出題する。渡さないときは従来どおり。
+   * nodeId を渡すとそのジャンルだけを、strategy を渡すとその選び方で出題する。
+   * どちらも渡さないときは従来どおり。
    */
-  function startLearning(mode, nodeId) {
+  function startLearning(mode, nodeId, strategy) {
     state.mode = MODES.indexOf(mode) >= 0 ? mode : 'learning';
     state.genreNodeId = String(nodeId || '');
+    state.strategy = String(strategy || '');
     state.excludeQuestionIds = [];
     state.failedQuestions.clear();
     clearPrefetch();
@@ -576,6 +630,9 @@
     'NO_QUESTION_IN_GENRE', 'NO_ELIGIBLE_QUESTION_IN_GENRE', 'UNKNOWN_GENRE'
   ];
 
+  // 間違えた問題・自信なし優先で、出せる問題が無いときの理由。
+  const MISTAKE_EMPTY_REASONS = ['NO_MISTAKE_QUESTION', 'NO_ELIGIBLE_MISTAKE_QUESTION'];
+
   function loadNextQuestion() {
     const seq = ++state.presentSeq;
     state.current = null;
@@ -606,6 +663,14 @@
             );
             return;
           }
+          // 復習対象が0件のとき。対象外の問題へ勝手に広げない。
+          if (q && MISTAKE_EMPTY_REASONS.indexOf(q.reason) >= 0) {
+            showQuestionNotice(
+              (q.genre_topic ? q.genre_topic + 'に' : '') + '復習したい問題がありません',
+              q.message || '間違えた問題も「自信なし」で答えた問題もまだありません。'
+            );
+            return;
+          }
           // ジャンルを選んだのに出せる問題が無いとき。他のジャンルへ勝手に広げない。
           if (q && GENRE_EMPTY_REASONS.indexOf(q.reason) >= 0) {
             showQuestionNotice(
@@ -630,8 +695,9 @@
       .getNextQuestion({
         mode: state.mode,
         excludeQuestionIds: state.excludeQuestionIds,
-        // '' なら絞り込みなし＝これまでと同じ出題。
+        // どちらも '' なら絞り込みなし＝これまでと同じ出題。
         nodeId: state.genreNodeId,
+        strategy: state.strategy,
         // ジャンル内で一巡を数えるためだけに使う（採点にもログにも使わない）。
         sessionId: state.sessionId
       });
@@ -940,7 +1006,8 @@
    * 成功したものだけを手元に残す（表示できない画像の問題を先読みで出さない）。
    */
   function prefetchKey() {
-    return state.mode + '|' + state.genreNodeId + '|' + state.excludeQuestionIds.join(',');
+    return state.mode + '|' + state.genreNodeId + '|' + state.strategy
+      + '|' + state.excludeQuestionIds.join(',');
   }
 
   function clearPrefetch() {
@@ -996,6 +1063,7 @@
         mode: state.mode,
         excludeQuestionIds: state.excludeQuestionIds.slice(),
         nodeId: state.genreNodeId,
+        strategy: state.strategy,
         sessionId: state.sessionId
       });
   }

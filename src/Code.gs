@@ -436,10 +436,12 @@ function clearGenreBreakdownCache_() {
  *   mode: "learning" | "review" | "unanswered",
  *   excludeQuestionIds: ["..."],
  *   nodeId: "DL-RNN" | "ALL" | 未指定,   // ジャンル指定（絞り込み条件。modeではない）
+ *   strategy: "mistakes" | 未指定,        // 出題方法（同上。modeではない）
  *   sessionId: "WEB-..."                 // ジャンル内の一巡を数えるためだけに使う
  * }
  *
- * nodeId が未指定・空・"ALL" のときは、これまでとまったく同じ経路を通る。
+ * nodeId と strategy がどちらも未指定（"ALL" や空を含む）のときは、
+ * これまでとまったく同じ経路を通る。
  */
 function getNextQuestion(request) {
   request = request || {};
@@ -455,13 +457,19 @@ function getNextQuestion(request) {
    * 未指定・ALL のときは '' になり、以降は従来どおりの経路を通る。
    */
   const genreNodeId = normalizeGenreNodeId_(request.nodeId);
+  const strategy = normalizeStrategy_(request.strategy);
   if (genreNodeId) {
-    return nextGenreQuestion_(formal, logs, genreNodeId, excludes, mode, request.sessionId);
+    return nextGenreQuestion_(formal, logs, genreNodeId, excludes, mode, request.sessionId, strategy);
   }
 
   // 未回答モードは独立した出題経路。既存のPhase8優先ロジックには入らない。
   if (mode === 'unanswered') {
     return nextUnansweredQuestion_(formal, logs, excludes);
+  }
+
+  // 間違えた問題・自信なし優先。ここも独立した出題経路。
+  if (strategy === 'mistakes') {
+    return nextMistakeQuestion_(formal, logs, excludes, mode, null);
   }
 
   /*
@@ -867,7 +875,7 @@ function normalizeGenreNodeId_(value) {
  * ここで行うのは「候補をそのジャンルへ絞ること」と「その中から1問選ぶこと」だけで、
  * 候補に入れてよいかどうかの条件は既存のものをそのまま使う。
  */
-function nextGenreQuestion_(formalQuestions, logs, nodeId, excludes, mode, sessionId) {
+function nextGenreQuestion_(formalQuestions, logs, nodeId, excludes, mode, sessionId, strategy) {
   // クライアントの値をそのまま信じない。02_マインドマップに実在する論点だけを通す。
   const node = readMindmapLeafNodes_().filter(n => n.node_id === nodeId)[0] || null;
   if (!node) {
@@ -898,6 +906,13 @@ function nextGenreQuestion_(formalQuestions, logs, nodeId, excludes, mode, sessi
    */
   if (mode === 'unanswered') {
     return decorateGenrePayload_(nextUnansweredQuestion_(candidates, logs, excludes), node);
+  }
+
+  // ジャンル×「間違えた問題・自信なし優先」。絞ったあとの選び方は共通のものを使う。
+  if (normalizeStrategy_(strategy) === 'mistakes') {
+    return decorateGenrePayload_(
+      nextMistakeQuestion_(candidates, logs, excludes, mode, node), node
+    );
   }
 
   return nextGenreRandomQuestion_(candidates, node, logs, excludes, mode, sessionId);
@@ -1025,6 +1040,244 @@ function writeGenreServed_(key, served) {
   } catch (e) {
     // 同上。書けなくても出題・採点・ログには影響しない。
   }
+}
+
+/* ------------------- 間違えた問題・自信なし優先（復習の集中演習） -------------------
+ *
+ * 復習したい問題の定義（この1か所だけで決める）:
+ *   03_問題台帳で verification_status=verified かつ active=TRUE の正式問題のうち、
+ *   04_学習ログで counts_for_mastery=TRUE の行に
+ *     ・is_correct が FALSE の行が1つでもある（＝過去に間違えた）
+ *     ・confidence が1以下の行が1つでもある（＝自信なしで答えた）
+ *   のどちらかが当てはまるもの。
+ *
+ * counts_for_mastery は04_学習ログU列のシート数式そのもの。
+ * provisional / system_test / write失敗 / mastery tracking開始前 は
+ * その数式が既に FALSE にしているため、ここで独自の除外条件を作らない
+ * （未回答優先モードと同じ根拠を使う）。
+ *
+ * 役割の境界（ここを越えない）:
+ * - 変えるのは「問題の選び方」だけ。採点・理解度・04_学習ログには触れない。
+ * - APP_CONFIG.MODES へは追加しない。これは mode ではなく出題の絞り込み条件で、
+ *   04_学習ログ G列 mode は learning / review / unanswered のまま既存互換を保つ。
+ * - 回答前のブラウザへ「この問題は前回間違えた」を送らない。
+ *   正解そのものではないが、自分の前回の回答と突き合わせれば選択肢を絞れてしまう。
+ *   画面へ返すのは残り件数（remaining_mistakes）だけにする。
+ */
+
+/** 出題の絞り込み条件。'' は既存どおりの選び方。 */
+const SELECTION_STRATEGIES = Object.freeze(['', 'mistakes']);
+
+const MISTAKE_CACHE_KEY = 'mistake_summary_v1';
+const MISTAKE_CACHE_SECONDS = 300;
+
+/** 残数を数えるためだけに読む04_学習ログの列（answered_at は並べ替え用なので要らない）。 */
+const MISTAKE_LOG_COLUMNS = Object.freeze([
+  'question_id', 'counts_for_mastery', 'is_correct', 'confidence'
+]);
+
+/**
+ * クライアントから届いた出題方法を、使える形へ直す。
+ * 知らない値が来たら既存の選び方（''）へ落とす。クライアントの値を信用しない。
+ */
+function normalizeStrategy_(value) {
+  const raw = String(value == null ? '' : value).trim();
+  return SELECTION_STRATEGIES.indexOf(raw) >= 0 ? raw : '';
+}
+
+/** ホーム画面の「間違えた問題・自信なしを優先して解く（N問）」の残数だけを返す。 */
+function getMistakeSummary() {
+  const startedAt = Date.now();
+  const summary = readMistakeSummary_();
+  logElapsed_('getMistakeSummary', startedAt);
+  return summary;
+}
+
+/**
+ * 復習したい問題の残数。
+ *
+ * 数え方は出題側と同じ（isFormalQuestion_ と mistakeStateByQuestion_）。
+ * 判定に使う列だけを読み、結果は数分だけ使い回す。
+ */
+function readMistakeSummary_() {
+  const cached = readMistakeSummaryCache_();
+  if (cached) return cached;
+
+  const formal = readColumns_(APP_CONFIG.SHEETS.QUESTIONS, UNANSWERED_QUESTION_COLUMNS)
+    .filter(isFormalQuestion_);
+  const states = mistakeStateByQuestion_(
+    readColumns_(APP_CONFIG.SHEETS.LOG, MISTAKE_LOG_COLUMNS)
+  );
+
+  const summary = { total: 0, latest_wrong: 0, low_confidence: 0, solved_but_marked: 0 };
+  formal.forEach(q => {
+    const state = states[String(q.question_id)];
+    if (!state || !state.needs_review) return;
+    summary.total++;
+    if (state.latest_wrong) summary.latest_wrong++;
+    else if (state.latest_low_confidence) summary.low_confidence++;
+    else summary.solved_but_marked++;
+  });
+
+  writeMistakeSummaryCache_(summary);
+  return summary;
+}
+
+/**
+ * question_id ごとの復習状態。
+ *
+ * 04_学習ログはシートの行順（＝古い順）なので、後の行で上書きすれば
+ * 最新の正式回答が残る。「一度でも」の判定は上書きせずに足していく。
+ * 判定根拠はU列 counts_for_mastery だけ。
+ */
+function mistakeStateByQuestion_(logs) {
+  const states = {};
+
+  (logs || []).forEach(row => {
+    if (!truthy_(row.counts_for_mastery)) return;
+    const qid = String(row.question_id || '');
+    if (!qid) return;
+
+    const wrong = !truthy_(row.is_correct);
+    // 自信度は1〜3。空の古い行は0になるので「自信なし」と決めつけない。
+    const lowConfidence = Number(row.confidence || 0) === 1;
+
+    const state = states[qid] || (states[qid] = {
+      ever_wrong: false, ever_low_confidence: false,
+      latest_wrong: false, latest_low_confidence: false,
+      latest_answered_at: null, needs_review: false
+    });
+
+    if (wrong) state.ever_wrong = true;
+    if (lowConfidence) state.ever_low_confidence = true;
+    state.latest_wrong = wrong;
+    state.latest_low_confidence = lowConfidence;
+    state.latest_answered_at = row.answered_at == null ? null : row.answered_at;
+    state.needs_review = state.ever_wrong || state.ever_low_confidence;
+  });
+
+  return states;
+}
+
+/**
+ * 間違えた問題・自信なしを優先した出題。
+ *
+ * 並べる順（弱いものから先に）:
+ *   1. 最新の正式回答が不正解
+ *   2. 最新の正式回答が「自信なし」
+ *   3. 過去に間違えた／自信なしだが、最新は正解かつ自信あり（定着の確認）
+ *   同点なら、最後に解いてから時間が経っているものを先に出す。
+ *   それも同じなら question_id 順（同点でも毎回同じ順番になるようにする）。
+ */
+function nextMistakeQuestion_(formalQuestions, logs, excludes, mode, node) {
+  const states = mistakeStateByQuestion_(logs);
+  const targets = formalQuestions.filter(q => {
+    const state = states[String(q.question_id)];
+    return !!state && state.needs_review;
+  });
+
+  if (!targets.length) {
+    return {
+      ok: false,
+      reason: 'NO_MISTAKE_QUESTION',
+      remaining_mistakes: 0,
+      message: node
+        ? 'このジャンルには、間違えた問題も「自信なし」で答えた問題もまだありません。'
+        : 'まだ間違えた問題も「自信なし」で答えた問題もありません。ふつうに解き進めると、ここへ溜まっていきます。'
+    };
+  }
+
+  const candidates = targets.filter(q => !excludes.has(String(q.question_id)));
+
+  // 画像を用意できるかの点検は、優先順位で並べたあと上から順に、
+  // 必要なぶんだけ行う（既存の出題経路と同じ考え方）。
+  const ordered = candidates.slice().sort((a, b) => compareMistakeCandidates_(a, b, states));
+  let picked = null;
+  for (const candidate of ordered) {
+    if (imageSupportAllowsQuestionObject_(candidate)) {
+      picked = candidate;
+      break;
+    }
+  }
+
+  if (!picked) {
+    // 復習したい問題は残っているが、いまは表示できない（画像取得に失敗した直後など）。
+    // 対象外の問題へは戻らない。
+    return {
+      ok: false,
+      reason: 'NO_ELIGIBLE_MISTAKE_QUESTION',
+      remaining_mistakes: targets.length,
+      message: 'いま表示できる復習対象の問題がありません。少し時間をおいてからお試しください。'
+    };
+  }
+
+  const nodeForPayload = node
+    || readMindmapLeafNodes_().filter(n => n.node_id === String(picked.primary_node_id || ''))[0]
+    || null;
+
+  const payload = publicQuestion_(picked, nodeForPayload, mode, true);
+  /*
+   * 残り件数だけを返す。
+   * 「この問題は前回間違えた」「自信なしだった」を1問ごとに返さないこと。
+   * 正解そのものではないが、自分の前回の回答と突き合わせると選択肢を絞れてしまう。
+   */
+  payload.remaining_mistakes = targets.length;
+  return payload;
+}
+
+/** 復習候補どうしの優先順位（上の説明の1〜3をそのまま数字にしたもの）。 */
+function compareMistakeCandidates_(a, b, states) {
+  const stateA = states[String(a.question_id)];
+  const stateB = states[String(b.question_id)];
+
+  const rankA = mistakeRank_(stateA);
+  const rankB = mistakeRank_(stateB);
+  if (rankA !== rankB) return rankA - rankB;
+
+  const timeA = mistakeAnsweredTime_(stateA);
+  const timeB = mistakeAnsweredTime_(stateB);
+  if (timeA !== timeB) return timeA - timeB;
+
+  return String(a.question_id).localeCompare(String(b.question_id));
+}
+
+function mistakeRank_(state) {
+  if (!state) return 3;
+  if (state.latest_wrong) return 0;
+  if (state.latest_low_confidence) return 1;
+  return 2;
+}
+
+function mistakeAnsweredTime_(state) {
+  const at = state ? dateFromCell_(state.latest_answered_at) : null;
+  return at ? at.getTime() : 0;
+}
+
+function readMistakeSummaryCache_() {
+  try {
+    const raw = CacheService.getUserCache().get(MISTAKE_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed.total === 'number' ? parsed : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeMistakeSummaryCache_(summary) {
+  try {
+    CacheService.getUserCache().put(
+      MISTAKE_CACHE_KEY, JSON.stringify(summary), MISTAKE_CACHE_SECONDS
+    );
+  } catch (e) {
+    // 使い回せなくても数え直せばよいので、失敗しても動作は変えない。
+  }
+}
+
+/** 回答を書き込んだ直後に呼ぶ。次にホームを開いたとき残数が新しくなる。 */
+function clearMistakeSummaryCache_() {
+  try {
+    CacheService.getUserCache().remove(MISTAKE_CACHE_KEY);
+  } catch (e) {}
 }
 
 function normalizeMode_(mode) {
@@ -1157,6 +1410,7 @@ function submitAnswer(payload) {
 
     // 1問解いたぶん、ホーム画面の未回答残数と弱点リストを取り直させる。
     clearUnansweredSummaryCache_();
+    clearMistakeSummaryCache_();
     clearWeaknessCache_();
     clearGenreBreakdownCache_();
 
@@ -1229,6 +1483,24 @@ function runSelfTest() {
       'Unanswered summary',
       unanswered.formal_total === eligibleCount && unanswered.remaining <= unanswered.formal_total,
       unanswered.remaining + ' / ' + unanswered.formal_total
+    );
+
+    /*
+     * 復習したい問題の残数（読むだけ。ログには書かない）。
+     *
+     * 「一度でも間違えた／自信なし」なので、回答済みの問題数を超えることはない。
+     * 内訳（最新が誤答／最新が自信なし／最新は正解）の合計とも一致する。
+     */
+    const mistakes = readMistakeSummary_();
+    push(
+      'Mistake summary',
+      mistakes.total <= unanswered.answered_unique
+        && mistakes.total ===
+           mistakes.latest_wrong + mistakes.low_confidence + mistakes.solved_but_marked,
+      mistakes.total + '問（最新が誤答' + mistakes.latest_wrong
+        + ' / 最新が自信なし' + mistakes.low_confidence
+        + ' / 最新は正解' + mistakes.solved_but_marked
+        + '）・回答済み' + unanswered.answered_unique + '問'
     );
 
     /*
