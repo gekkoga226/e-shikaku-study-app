@@ -58,6 +58,13 @@ ENTROPY_TEXT = (
     '/ 空欄（あ）に当てはまる式を以下のうちから選べ。'
 )
 
+# 同じ大問の別の行（KLダイバージェンスDKL(p‖q)＝（う）を問う版）。
+# 台帳では（あ）〜（え）ごとに別の question_id・別の画像として分かれている。
+ENTROPY_TEXT_KL = ENTROPY_TEXT.replace(
+    '/ 空欄（あ）に当てはまる式を以下のうちから選べ。',
+    '/ 空欄（う）に当てはまる式を以下のうちから選べ。',
+)
+
 
 def question(**overrides):
     """判定に使う列だけを持つ、1問ぶんの行を作る。"""
@@ -277,6 +284,27 @@ class TestEntropyQuestionIsComplete(unittest.TestCase):
         [reasons] = gaps_for([question(
             question_id='EXAM-A1-Q011',
             question_text=ENTROPY_TEXT,
+            question_image_refs='images/a1-q011-r.png;images/a1-q011-a.png;'
+                                'images/a1-q011-b.png;images/a1-q011-c.png;images/a1-q011-d.png',
+            option_a='[Aの画像選択肢]', option_b='[Bの画像選択肢]',
+            option_c='[Cの画像選択肢]', option_d='[Dの画像選択肢]',
+        )])
+        self.assertEqual(
+            reasons, [],
+            '解ける問題を不足として報告しています: %s' % reasons,
+        )
+
+    def test_kl_divergence_variant_is_not_flagged(self):
+        """同じ大問の別の行（（う）＝KLダイバージェンスを問う版）も同様に不足なしとなること。
+
+        本文中の「（う）」は定義の文とラベル参照の文の2か所に出てくるので
+        BLANK_NOT_FOUND にはならず、選択肢4つに画像がそろっていれば
+        OPTION_PLACEHOLDER にもならない。
+        """
+        require_node(self)
+        [reasons] = gaps_for([question(
+            question_id='EXAM-A1-Q011',
+            question_text=ENTROPY_TEXT_KL,
             question_image_refs='images/a1-q011-r.png;images/a1-q011-a.png;'
                                 'images/a1-q011-b.png;images/a1-q011-c.png;images/a1-q011-d.png',
             option_a='[Aの画像選択肢]', option_b='[Bの画像選択肢]',
