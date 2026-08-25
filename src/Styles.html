@@ -10,6 +10,8 @@
   --accent-soft: #eaf0ff;
   --good: #157347;
   --bad: #b42318;
+  /* 正解したが自信なし。緑と赤のどちらとも見分けがつく黄色にする。 */
+  --unsure: #d99400;
   --shadow: 0 10px 30px rgba(23, 32, 51, .08);
 
   /*
@@ -99,6 +101,10 @@ button { touch-action: manipulation; }
   gap: 10px;
   margin-bottom: 16px;
 }
+/* 5つ目のように半端に余るものは、横いっぱいに置く。 */
+.metric-wide { grid-column: 1 / -1; }
+.metric.unsure { border-color: var(--unsure); }
+.metric.unsure .metric-value { color: var(--unsure); }
 .metric {
   background: var(--card);
   border: 1px solid var(--line);
@@ -157,7 +163,8 @@ button { touch-action: manipulation; }
 
 /*
   ジャンル別の弱点。
-  帯グラフは「最新正解 / 最新誤答 / 未回答」の3つを横に並べる。
+  帯グラフは「最新正解（自信あり）/ 正解したが自信なし / 最新誤答 / 未回答」の
+  4つを横に並べる。黄色は緑の内訳なので、帯の合計は総問題数のまま変わらない。
   幅は % で与えるが、0%のときは要素ごと出さない（1pxの線が残らないように）。
 */
 .genre-list { display: grid; gap: 12px; margin-top: 14px; }
@@ -179,6 +186,7 @@ button { touch-action: manipulation; }
 }
 .genre-seg { height: 100%; }
 .genre-seg.correct { background: var(--good); }
+.genre-seg.unsure { background: var(--unsure); }
 .genre-seg.wrong { background: var(--bad); }
 .genre-seg.unanswered { background: #d3d9e4; }
 .genre-numbers { font-size: 13px; color: var(--muted); }
@@ -196,6 +204,21 @@ button { touch-action: manipulation; }
 .genre-topic-name { font-weight: 700; font-size: 14px; }
 .genre-actions { margin-top: 16px; }
 .genre-mistakes { font-size: 13px; margin-top: 4px; }
+.genre-unsure-line { margin-top: 2px; }
+.genre-unsure-line b { color: var(--unsure); }
+/* 帯グラフの色の意味。読み込み前でも意味が分かるよう、静的に置いている。 */
+.genre-legend {
+  display: flex; flex-wrap: wrap; gap: 6px 14px;
+  margin-top: 10px; font-size: 12px; color: var(--muted);
+}
+.genre-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.genre-legend i {
+  width: 10px; height: 10px; border-radius: 3px;
+  background: #d3d9e4; flex: none;
+}
+.genre-legend i.correct { background: var(--good); }
+.genre-legend i.unsure { background: var(--unsure); }
+.genre-legend i.wrong { background: var(--bad); }
 
 .centered { text-align: center; padding: 34px 18px; }
 .spinner {
