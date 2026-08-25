@@ -30,6 +30,8 @@
     // ジャンル別画面。表示するだけで、出題・採点・理解度には一切関わらない。
     genre: null,
     genreMistakes: null,
+    // 「正解したが自信なし」。内訳が届くまでは null（帯グラフに黄色を出さない）。
+    genreUnsure: null,
     genreOpen: new Set(),
     /*
      * 結果画面を読んでいるあいだに用意しておくAI解説。
@@ -260,13 +262,15 @@
   function forgetGenreData() {
     state.genre = null;
     state.genreMistakes = null;
+    state.genreUnsure = null;
     const btn = $('genreMistakeBtn');
     btn.disabled = false;
     btn.classList.remove('hidden');
     btn.textContent = 'これまでに間違えた問題数も見る';
     $('genreMistakeNote').textContent =
       '帯グラフの「誤答」は、理解度と同じく最新の正式回答が不正解の問題数です。'
-      + '一度間違えたあと復習で正解にできた問題は含みません。';
+      + '一度間違えたあと復習で正解にできた問題は含みません。'
+      + '黄色は最新の正式回答が正解で、その自信が「1 自信なし」だった問題数です。';
   }
 
   function loadGenreBreakdown() {
@@ -280,6 +284,8 @@
           ? '正答率が低い順（' + data.totals.topic_count + '論点）'
           : '正答率が低い順';
         renderGenreBreakdown();
+        // 帯グラフの黄色（正解したが自信なし）は、表示を待たせずに後から足す。
+        loadGenreUnsureCorrect();
       })
       .withFailureHandler(err => {
         waiting.stop();
@@ -313,6 +319,24 @@
       .getGenreMistakeHistory();
   }
 
+  /*
+   * 「正解したが自信なし」の内訳。
+   *
+   * 自信度は02_マインドマップに無いので04_学習ログを読む必要があるが、
+   * ボタンにはしない（たまたま正解した問題は、探しに行かないと気づけないため）。
+   * 内訳が届いたところで帯グラフを描き直すだけなので、初回表示は待たされない。
+   * 読めなかったときは黄色を出さずに終わる（それ以外の数字は正しいまま）。
+   */
+  function loadGenreUnsureCorrect() {
+    google.script.run
+      .withSuccessHandler(data => {
+        state.genreUnsure = data && data.by_node ? data : null;
+        renderGenreBreakdown();
+      })
+      .withFailureHandler(() => {})
+      .getGenreUnsureCorrect();
+  }
+
   function renderGenreBreakdown() {
     const data = state.genre;
     const list = $('genreList');
@@ -326,14 +350,23 @@
       appendMetric(totals, '回答済み', data.totals.answered + '問（' + data.totals.answered_pct + '%）');
       appendMetric(totals, '未回答', data.totals.unanswered + '問');
       appendMetric(totals, '正答率', data.totals.correct_pct + '%');
+      // 「正解したが自信なし」は後から届く。届く前は枠ごと出さない。
+      const unsure = unsureCorrectOf(
+        data.genres.reduce((acc, g) => acc.concat(g.topics || []), []),
+        data.totals.latest_correct
+      );
+      if (state.genreUnsure) {
+        appendMetric(totals, '自信なし正解（たまたま当たった問題）',
+                     unsure + '問', 'metric-wide unsure');
+      }
     }
 
     data.genres.forEach(genre => list.appendChild(genreCard(genre)));
   }
 
-  function appendMetric(parent, label, value) {
+  function appendMetric(parent, label, value, extraClass) {
     const div = document.createElement('div');
-    div.className = 'metric';
+    div.className = extraClass ? 'metric ' + extraClass : 'metric';
     const l = document.createElement('div');
     l.className = 'metric-label';
     l.textContent = label;
@@ -358,7 +391,8 @@
     rates.textContent = '回答率 ' + genre.answered_pct + '% ／ 正答率 ' + genre.correct_pct + '%';
     head.append(name, rates);
 
-    card.append(head, genreBar(genre), genreNumbers(genre));
+    const unsure = unsureCorrectOf(genre.topics, genre.latest_correct);
+    card.append(head, genreBar(genre, unsure), genreNumbers(genre, unsure));
 
     const mistakes = genreEverWrong(genre);
     if (mistakes !== null) {
@@ -408,7 +442,8 @@
     rates.textContent = '理解度 ' + topic.mastery_pct + '%';
     head.append(name, rates);
 
-    row.append(head, genreBar(topic), genreNumbers(topic));
+    const unsure = unsureCorrectOf([topic], topic.latest_correct);
+    row.append(head, genreBar(topic, unsure), genreNumbers(topic, unsure));
 
     const mistakes = state.genreMistakes && state.genreMistakes.by_node
       ? Number(state.genreMistakes.by_node[topic.node_id] || 0)
@@ -423,17 +458,21 @@
   }
 
   /*
-   * 帯グラフ。総問題数を1本の帯にして「最新正解 / 最新誤答 / 未回答」で割る。
+   * 帯グラフ。総問題数を1本の帯にして
+   * 「最新正解（自信あり） / 正解したが自信なし / 最新誤答 / 未回答」で割る。
    * 0件の区画は要素ごと出さない（幅0の線が残らないようにする）。
+   *
+   * 黄色は緑の内訳なので、緑からそのぶんを引く。帯の合計は総問題数のまま。
    */
-  function genreBar(counts) {
+  function genreBar(counts, unsureCorrect) {
     const bar = document.createElement('div');
     bar.className = 'genre-bar';
     const total = Number(counts.total) || 0;
     if (!total) return bar;
 
-    [['correct', counts.latest_correct], ['wrong', counts.latest_wrong],
-     ['unanswered', counts.unanswered]].forEach(pair => {
+    const unsure = Number(unsureCorrect) || 0;
+    [['correct', Number(counts.latest_correct || 0) - unsure], ['unsure', unsure],
+     ['wrong', counts.latest_wrong], ['unanswered', counts.unanswered]].forEach(pair => {
       const value = Number(pair[1]) || 0;
       if (value <= 0) return;
       const seg = document.createElement('div');
@@ -444,15 +483,37 @@
     return bar;
   }
 
-  function genreNumbers(counts) {
+  function genreNumbers(counts, unsureCorrect) {
     const div = document.createElement('div');
     div.className = 'genre-numbers';
+    const unsure = Number(unsureCorrect) || 0;
     div.innerHTML = '全<b>' + counts.total + '</b>問中　'
       + '回答済み<b>' + counts.answered + '</b>問（' + counts.answered_pct + '%）'
       + '／未回答<b>' + counts.unanswered + '</b>問　'
       + '正解<b>' + counts.latest_correct + '</b>・誤答<b>' + counts.latest_wrong + '</b>'
       + '（正答率' + counts.correct_pct + '%）';
+    if (unsure > 0) {
+      const line = document.createElement('div');
+      line.className = 'genre-unsure-line';
+      line.innerHTML = '正解のうち<b>' + unsure + '</b>問は「自信なし」で答えています。';
+      div.appendChild(line);
+    }
     return div;
+  }
+
+  /**
+   * 「正解したが自信なし」の問数。読み込み前・読めなかったときは0（黄色を出さない）。
+   *
+   * 黄色は04_学習ログ、緑は02_マインドマップと元が違う。
+   * 集計の時点がずれても緑より大きい黄色を描かないよう、ここで止める。
+   */
+  function unsureCorrectOf(topics, latestCorrect) {
+    const byNode = state.genreUnsure && state.genreUnsure.by_node;
+    if (!byNode) return 0;
+    const counted = (topics || []).reduce(
+      (sum, t) => sum + Number(byNode[t.node_id] || 0), 0
+    );
+    return Math.max(0, Math.min(counted, Number(latestCorrect) || 0));
   }
 
   /** ジャンル配下の論点ぶんを足す。読み込み前は null（行ごと出さない）。 */

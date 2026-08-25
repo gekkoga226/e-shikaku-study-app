@@ -92,10 +92,17 @@
           <span id="genreHint" class="muted">読み込み中...</span>
         </div>
         <p class="hint">
-          正答率が低いジャンルから並べています。数字はすべて
+          正答率が低いジャンルから並べています。数字は
           02_マインドマップ（理解度の計算元）の値をそのまま合計したものです。
+          黄色の「自信なし正解」だけは、自信度を持つ04_学習ログから数えています。
         </p>
         <div id="genreTotals" class="metric-grid"></div>
+        <div class="genre-legend">
+          <span><i class="correct"></i>正解（自信あり）</span>
+          <span><i class="unsure"></i>正解だが「1 自信なし」</span>
+          <span><i class="wrong"></i>誤答</span>
+          <span><i></i>未回答</span>
+        </div>
         <div id="genreList" class="genre-list"></div>
         <div class="genre-actions">
           <button id="genreMistakeBtn" class="secondary-btn" type="button">
@@ -104,6 +111,7 @@
           <p id="genreMistakeNote" class="hint">
             帯グラフの「誤答」は、理解度と同じく<strong>最新の正式回答が不正解</strong>の問題数です。
             一度間違えたあと復習で正解にできた問題は含みません。
+            黄色は<strong>最新の正式回答が正解で、その自信が「1 自信なし」だった</strong>問題数です。
           </p>
         </div>
         <button id="genreHomeBtn" class="secondary-btn big" type="button">ホームへ戻る</button>

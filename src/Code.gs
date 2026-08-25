@@ -195,10 +195,15 @@ function logElapsed_(label, startedAt) {
  *   最新正解   latest_unique_correct_count（各問題の最新の正式回答が正解のもの）
  * 22論点の合計は 06_ダッシュボードの「verified問題数」「ユニーク回答済み問題数」と
  * 一致する。ここで別の数え方を作らないこと。
+ *
+ * ただし「正解したが自信なし」（帯グラフの黄色）だけは02_マインドマップに元が無い。
+ * 自信度は04_学習ログK列にしか無いため、そこだけ別の呼び出しで数える。
+ * 数えるのは最新の正式回答が正解の問題の一部なので、緑の内訳であって外側ではない。
  */
 
 const GENRE_CACHE_KEY = 'genre_breakdown_v1';
 const GENRE_MISTAKE_CACHE_KEY = 'genre_mistakes_v1';
+const GENRE_UNSURE_CACHE_KEY = 'genre_unsure_correct_v1';
 const GENRE_CACHE_SECONDS = 300;
 const GENRE_UNKNOWN_LABEL = '未分類';
 
@@ -383,6 +388,93 @@ function buildGenreMistakeHistory_(logs) {
   return { by_node: byNode, total: total };
 }
 
+/*
+ * 「正解したが自信なし」だけを別の呼び出しにする。
+ *
+ * 帯グラフの緑（最新の正式回答が正解）には、たまたま当たっただけの問題も混ざる。
+ * そこを黄色で切り出して、重点的に復習するジャンルを選べるようにする。
+ *
+ * 数える条件は、04_学習ログで counts_for_mastery=TRUE の行のうち
+ * その問題の最新の行が is_correct=TRUE かつ confidence=1 のもの。
+ * 「最新の正式回答」で見るのは、帯グラフの緑（latest_unique_correct_count）と
+ * 同じ状態を指す必要があるため。「一度でも自信なしだった」はここでは数えない
+ * （それはホームの「間違えた問題・自信なしを優先」が扱う別の数え方）。
+ *
+ * 02_マインドマップには自信度が無いので、根拠は04_学習ログしかない。
+ * 読む列は getGenreMistakeHistory と同じ範囲に confidence（K列）を足しただけで、
+ * K列は is_correct（J列）の隣なので読み取り回数は増えない。
+ */
+const GENRE_UNSURE_LOG_COLUMNS = Object.freeze([
+  'question_id', 'primary_node_id', 'is_correct', 'confidence', 'counts_for_mastery'
+]);
+
+function getGenreUnsureCorrect() {
+  const startedAt = Date.now();
+
+  const cached = readGenreUnsureCache_();
+  if (cached) return cached;
+
+  const data = buildGenreUnsureCorrect_(
+    readColumns_(APP_CONFIG.SHEETS.LOG, GENRE_UNSURE_LOG_COLUMNS, { maxGap: GENRE_LOG_MAX_GAP })
+  );
+  writeGenreUnsureCache_(data);
+  logElapsed_('getGenreUnsureCorrect', startedAt);
+  return data;
+}
+
+/**
+ * 最新の正式回答が「正解かつ自信なし」の問題を、question_id単位で数える。
+ *
+ * 04_学習ログはシートの行順（＝古い順）なので、後の行で上書きすれば最新が残る。
+ * 判定根拠はU列 counts_for_mastery だけ（誤答数の数え方と同じ）。
+ */
+function buildGenreUnsureCorrect_(logs) {
+  const latestByQuestion = {};
+
+  (logs || []).forEach(row => {
+    if (!truthy_(row.counts_for_mastery)) return;
+    const qid = String(row.question_id || '');
+    if (!qid) return;
+    latestByQuestion[qid] = {
+      node_id: String(row.primary_node_id || ''),
+      correct: truthy_(row.is_correct),
+      // 自信度は1〜3。空の古い行は0になるので「自信なし」と決めつけない。
+      unsure: Number(row.confidence || 0) === 1
+    };
+  });
+
+  const byNode = {};
+  let total = 0;
+  Object.keys(latestByQuestion).forEach(qid => {
+    const latest = latestByQuestion[qid];
+    if (!latest.correct || !latest.unsure) return;
+    total++;
+    const nodeId = latest.node_id;
+    if (!nodeId) return;
+    byNode[nodeId] = (byNode[nodeId] || 0) + 1;
+  });
+
+  return { by_node: byNode, total: total };
+}
+
+function readGenreUnsureCache_() {
+  try {
+    const raw = CacheService.getUserCache().get(GENRE_UNSURE_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && parsed.by_node ? parsed : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeGenreUnsureCache_(data) {
+  try {
+    CacheService.getUserCache().put(
+      GENRE_UNSURE_CACHE_KEY, JSON.stringify(data), GENRE_CACHE_SECONDS
+    );
+  } catch (e) {}
+}
+
 function readGenreBreakdownCache_() {
   try {
     const raw = CacheService.getUserCache().get(GENRE_CACHE_KEY);
@@ -425,6 +517,7 @@ function clearGenreBreakdownCache_() {
     const cache = CacheService.getUserCache();
     cache.remove(GENRE_CACHE_KEY);
     cache.remove(GENRE_MISTAKE_CACHE_KEY);
+    cache.remove(GENRE_UNSURE_CACHE_KEY);
     // ジャンル選択肢に出している理解度も、次に開いたとき新しくなる。
     cache.remove(GENRE_OPTIONS_CACHE_KEY);
   } catch (e) {}
