@@ -110,8 +110,6 @@ const CONTENT_AUDIT_RULES = Object.freeze({
   IMAGE_WORDS: /(図|グラフ|画像|イラスト|以下の表|下表|次の表)/,
   // 空欄補充であることを示す言い回し。
   BLANK_WORDS: /([（(][ぁ-んァ-ヶA-Za-z][）)]|空欄|穴埋め|[［\[]\s*[）)]?\s*[］\]])/,
-  // 選択肢が画像前提であることを示す内部用の目印。
-  OPTION_PLACEHOLDER: /(画像選択肢|選択肢画像)/,
   // 「プログラムを見ないと解けない」ことを示す言い回し。
   PROGRAM_WORDS: /(プログラム|ソースコード|擬似コード|疑似コード|コード中|次のコード|以下のコード)/,
   /*
@@ -188,16 +186,19 @@ function findQuestionContentGaps_(q) {
   const text = String(q.question_text || '');
   const hasImage = parseImageRefs_(q.question_image_refs).length > 0;
 
-  const optionText = 'ABCDEFGH'.split('')
-    .map(letter => String(q['option_' + letter.toLowerCase()] || ''))
-    .join('\n');
-
   const reasons = [];
 
   if (!hasImage && CONTENT_AUDIT_RULES.IMAGE_WORDS.test(text)) reasons.push('NEEDS_IMAGE');
-  if (!hasImage && CONTENT_AUDIT_RULES.OPTION_PLACEHOLDER.test(optionText)) {
-    reasons.push('OPTION_PLACEHOLDER');
-  }
+
+  /*
+   * 「[Aの画像選択肢]」のような目印のままで、その選択肢の画像が無い。
+   *
+   * 画像が1枚も無い問題だけでなく、画像はあるのに一部の選択肢ぶんだけ
+   * 足りていない問題も報告する。4択のうち1つにしか画像が割り当たっていない
+   * ような行は、画像があるぶん「画像が無い問題」としては見つからないため。
+   */
+  const manifest = IMAGE_ROLE_MAP_BY_QUESTION_ID[String(q.question_id || '')];
+  if (!optionImagesCoverPlaceholders_(q, manifest)) reasons.push('OPTION_PLACEHOLDER');
 
   /*
    * 「プログラム中の（き）」のように、プログラムを見ないと解けないと言っているのに

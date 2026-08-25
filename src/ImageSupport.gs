@@ -38,6 +38,45 @@ function imageSupportAllowsQuestionObject_(q) {
   for (let i = 0; i < refs.length; i++) {
     if (!covered.has(i)) return false;
   }
+
+  // 選択肢が画像前提の目印のままなのに、その選択肢の画像が無い問題は出題しない。
+  return optionImagesCoverPlaceholders_(q, manifest);
+}
+
+/*
+ * 03_問題台帳には「[Aの画像選択肢]」のような内部用の目印が入っている行がある。
+ * これは画面へ出す文章ではないので、その選択肢の画像が表示できたときだけ隠す。
+ *
+ * この目印と同じ判定を Client.html の OPTION_IMAGE_PLACEHOLDER も持っている。
+ * 片方だけ直すと、サーバーが出題した問題をブラウザ側が捨てることになるので、
+ * 直すときは必ず両方そろえる（tests/test_image_option_mapping.py が一致を見張っている）。
+ */
+const OPTION_IMAGE_PLACEHOLDER_PATTERN =
+  /^[\[［(（]?\s*(?:選択肢)?\s*[A-Ha-h]?\s*の?\s*(?:画像選択肢|選択肢画像|画像)\s*[A-Ha-h]?\s*[\]］)）]?$/;
+
+function isOptionImagePlaceholder_(text) {
+  const value = String(text == null ? '' : text).trim();
+  if (!value) return false;
+  return OPTION_IMAGE_PLACEHOLDER_PATTERN.test(value);
+}
+
+/**
+ * 画像前提の目印になっている選択肢すべてに、画像が割り当たっているか。
+ *
+ * 目印のままで画像が無い選択肢が1つでもあると、
+ * 学習者には「何を選ぶのか分からない選択肢」が並ぶ。
+ * ブラウザ側でも同じ状態を見つけて問題を止めるが、
+ * そこまで進むと1問ぶんスキップの表示を挟むことになるので、出題する前に外す。
+ */
+function optionImagesCoverPlaceholders_(q, manifest) {
+  const optionImages = (manifest && manifest.o) || {};
+  const letters = 'ABCDEFGH'.split('');
+  for (let i = 0; i < letters.length; i++) {
+    const letter = letters[i];
+    if (!isOptionImagePlaceholder_(q['option_' + letter.toLowerCase()])) continue;
+    const images = optionImages[letter] || [];
+    if (!images.length) return false;
+  }
   return true;
 }
 

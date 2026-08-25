@@ -414,5 +414,88 @@ class TestOptionPlaceholderText(unittest.TestCase):
         )
 
 
+class TestServerSkipsIncompleteOptionImages(unittest.TestCase):
+    """画像が一部の選択肢にしか無い問題を、出題する前に外していること。
+
+    ブラウザ側にも同じ見張り（OPTION_IMAGE_MISSING）があるが、
+    そこまで進むと学習者は「スキップしました」の表示を1問ぶん挟むことになる。
+    サーバー側で候補から外して、その1往復ごと無くす。
+    """
+
+    def setUp(self):
+        require_node(self)
+
+    def allows(self, options, manifest_options):
+        refs = ['images/%s.png' % letter.lower() for letter in sorted(manifest_options)]
+        row = {'question_id': 'EXAM-TEST-Q001',
+               'question_image_refs': ';'.join(refs) or 'images/only.png'}
+        for letter, text in options.items():
+            row['option_' + letter.lower()] = text
+
+        script = '\n'.join([
+            # 署名はGAS本体と同じ計算にする（ここを固定値にすると検査を素通りする）。
+            "import { createHash } from 'node:crypto';",
+            'globalThis.Utilities = {',
+            '  DigestAlgorithm: { SHA_256: "sha256" },',
+            '  Charset: { UTF_8: "utf8" },',
+            '  computeDigest: (algo, value) => Array.from('
+            '    createHash("sha256").update(value, "utf8").digest()'
+            '  ).map(b => (b > 127 ? b - 256 : b))',
+            '};',
+            'globalThis.CacheService = undefined;',
+            read('ImageSupport.gs'),
+            'const refs = %s;' % js_value(refs),
+            'globalThis.IMAGE_ROLE_MAP_BY_QUESTION_ID = { "EXAM-TEST-Q001": '
+            '{ v: 1, q: [], o: %s, s: imageRefsSignature_(refs) } };' % js_value(manifest_options),
+            'console.log(JSON.stringify('
+            '{ allowed: imageSupportAllowsQuestionObject_(%s) }));' % js_value(row),
+        ])
+        return run(script)['allowed']
+
+    def test_all_placeholders_with_all_images_is_offered(self):
+        self.assertTrue(
+            self.allows(
+                placeholder_options(['A', 'B', 'C', 'D']),
+                {'A': [0], 'B': [1], 'C': [2], 'D': [3]},
+            ),
+            '4択すべてに画像がある問題を出題できていません',
+        )
+
+    def test_placeholder_without_its_image_is_not_offered(self):
+        self.assertFalse(
+            self.allows(placeholder_options(['A', 'B', 'C', 'D']), {'B': [0]}),
+            'Bにしか画像が無いのに、目印のままの選択肢で出題しています',
+        )
+
+    def test_text_options_beside_one_image_option_are_offered(self):
+        self.assertTrue(
+            self.allows(
+                {'A': 'シグモイド関数', 'B': '[Bの画像選択肢]',
+                 'C': 'ReLU関数', 'D': '恒等関数'},
+                {'B': [0]},
+            ),
+            '文字の選択肢が並ぶ正常な問題まで出題から外しています',
+        )
+
+
+class TestPlaceholderPatternStaysInSync(unittest.TestCase):
+    """プレースホルダの判定が、サーバーとブラウザで同じであること。
+
+    片方だけ直すと、サーバーが出した問題をブラウザが捨てる
+    （＝出題できる問題が黙って減る）状態になる。
+    """
+
+    def test_patterns_are_identical(self):
+        pattern = re.compile(r'/\^\[.*?\$/')
+        server = pattern.search(strip_comments(read('ImageSupport.gs')))
+        client = pattern.search(strip_comments(html_script('Client.html')))
+        self.assertIsNotNone(server, 'ImageSupport.gs にプレースホルダの判定がありません')
+        self.assertIsNotNone(client, 'Client.html にプレースホルダの判定がありません')
+        self.assertEqual(
+            server.group(0), client.group(0),
+            'サーバーとブラウザでプレースホルダの判定がずれています',
+        )
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

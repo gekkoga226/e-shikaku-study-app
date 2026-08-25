@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gas_source import function_body, read, strip_comments  # noqa: E402
 from js_runtime import gas_bundle, js_value, require_node, run  # noqa: E402
 
-AUDIT_FILES = ('ImageSupport.gs', 'ImageSelfTest.gs')
+AUDIT_FILES = ('ImageManifest.gs', 'ImageSupport.gs', 'ImageSelfTest.gs')
 
 # 実際に出題されている形（深層モデルのための最適化・図1/図2 + backprop）。
 BACKPROP_TEXT = (
@@ -44,6 +44,18 @@ BACKPROP_TEXT_WITH_PROGRAM = BACKPROP_TEXT.replace(
     'def update(w, grad, learning_rate, batch_size):\n'
     '    return （き）\n'
     'プログラム中の（き）に当てはまる選択肢を以下のうちから１つ選べ。'
+)
+
+
+# 実際に出題されている形（情報理論・（あ）〜（え）の4空欄・選択肢は数式画像）。
+ENTROPY_TEXT = (
+    '情報理論に関して、事象xに対して確率pがあるとき、'
+    'そのエントロピー（平均情報量）の式は（あ）である。'
+    'さらに確率qとしたとき、交差エントロピーの式は（い）のように表すことができる。'
+    'また、確率分布P,Qがあって、確率変数をp(x),q(x)としたとき、'
+    'r(x)が以下のような式を満たすとすると、KLダイバージェンスDKL(p‖q)を表す式は（う）となり、'
+    'JSダイバージェンスDJS(p||q)を表す式は（え）となる。'
+    '/ 空欄（あ）に当てはまる式を以下のうちから選べ。'
 )
 
 
@@ -251,6 +263,79 @@ class TestAuditReport(unittest.TestCase):
         for forbidden in ('setValue', 'appendRow', 'getRange(', 'SpreadsheetApp'):
             self.assertNotIn(forbidden, body,
                              '監査がスプレッドシートへ書き込もうとしています: %s' % forbidden)
+
+
+class TestEntropyQuestionIsComplete(unittest.TestCase):
+    """（あ）〜（え）の4空欄を分けた問題が、誤って不足扱いされないこと。
+
+    本文が（あ）を定義したうえで（あ）を問うており、選択肢4つは画像で
+    そろっている。解ける問題なので、監査は何も報告してはいけない。
+    """
+
+    def test_entropy_question_is_not_flagged(self):
+        require_node(self)
+        [reasons] = gaps_for([question(
+            question_id='EXAM-A1-Q011',
+            question_text=ENTROPY_TEXT,
+            question_image_refs='images/a1-q011-r.png;images/a1-q011-a.png;'
+                                'images/a1-q011-b.png;images/a1-q011-c.png;images/a1-q011-d.png',
+            option_a='[Aの画像選択肢]', option_b='[Bの画像選択肢]',
+            option_c='[Cの画像選択肢]', option_d='[Dの画像選択肢]',
+        )])
+        self.assertEqual(
+            reasons, [],
+            '解ける問題を不足として報告しています: %s' % reasons,
+        )
+
+    def test_referenced_blank_is_defined_in_the_text(self):
+        """（あ）は本文で定義されているので、名指しの空欄として残らないこと。"""
+        require_node(self)
+        script = '\n'.join([
+            gas_bundle(AUDIT_FILES),
+            'console.log(JSON.stringify(findUnresolvedBlanks_(%s)));' % js_value(ENTROPY_TEXT),
+        ])
+        self.assertEqual(run(script), [])
+
+
+class TestOptionImageCoverage(unittest.TestCase):
+    """画像はあるのに、一部の選択肢だけ画像が足りない問題を見つけること。"""
+
+    MANIFEST_ONLY_B = {
+        'EXAM-A2-Q027': {'v': 1, 'q': [], 'o': {'B': [0]}, 's': 'ignored'}
+    }
+
+    def gaps_with_manifest(self, row, manifest):
+        """差し替えたmanifestで findQuestionContentGaps_ を動かす。"""
+        script = '\n'.join([
+            gas_bundle(('ImageSupport.gs', 'ImageSelfTest.gs')),
+            'globalThis.IMAGE_ROLE_MAP_BY_QUESTION_ID = %s;' % js_value(manifest),
+            'console.log(JSON.stringify(findQuestionContentGaps_(%s)));' % js_value(row),
+        ])
+        return run(script)
+
+    def test_partial_option_images_are_flagged(self):
+        require_node(self)
+        reasons = self.gaps_with_manifest(question(
+            question_id='EXAM-A2-Q027',
+            question_image_refs='images/a2-q027-b.png',
+            option_a='[Aの画像選択肢]', option_b='[Bの画像選択肢]',
+            option_c='[Cの画像選択肢]', option_d='[Dの画像選択肢]',
+        ), self.MANIFEST_ONLY_B)
+        self.assertIn(
+            'OPTION_PLACEHOLDER', reasons,
+            '画像が一部の選択肢にしか無い問題を見落としています',
+        )
+
+    def test_text_options_beside_one_image_option_are_not_flagged(self):
+        """A/C/Dが文字の選択肢で、Bだけが画像の問題は正常なので報告しないこと。"""
+        require_node(self)
+        reasons = self.gaps_with_manifest(question(
+            question_id='EXAM-A2-Q027',
+            question_image_refs='images/a2-q027-b.png',
+            option_a='シグモイド関数', option_b='[Bの画像選択肢]',
+            option_c='ReLU関数', option_d='恒等関数',
+        ), self.MANIFEST_ONLY_B)
+        self.assertEqual(reasons, [], '正常な問題を報告しています: %s' % reasons)
 
 
 if __name__ == '__main__':

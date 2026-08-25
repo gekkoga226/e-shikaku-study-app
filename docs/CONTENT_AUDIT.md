@@ -36,14 +36,19 @@ EXAM-A3-Q009     NEEDS_PROGRAM+BLANK_NOT_FOUND  412          true       き     
 | `BLANK_NOT_FOUND` | 「（き）に当てはまる」の（き）が、本文の他のどこにも出てこない | 空欄を含む段落やプログラムを `question_text` へ補う |
 | `MISSING_CONTEXT` | `（あ）` などの空欄を指しているのに、本文が短く前提が無い | 元の問題文（前提の段落）を本文へ補う |
 | `TRUNCATED_TEXT` | 本文が句点などで終わっておらず、文の途中で切れている | 元問題から本文を取り直す |
-| `OPTION_PLACEHOLDER` | 選択肢が `[Aの画像選択肢]` のままで画像が無い | 選択肢画像を登録するか、文字の選択肢に書き直す |
+| `OPTION_PLACEHOLDER` | 選択肢が `[Aの画像選択肢]` のままなのに、その選択肢の画像が無い | 選択肢画像を登録するか、文字の選択肢に書き直す |
 | `NO_EXPLANATION` | `explanation_*` がすべて空 | 解説を登録する（AI補助解説の材料にもなる） |
 
 ### `has_image` が `true` でも報告されることがあります
 
-`NEEDS_PROGRAM` と `BLANK_NOT_FOUND` は、**画像がある問題でも報告します**。
+`NEEDS_PROGRAM` `BLANK_NOT_FOUND` `OPTION_PLACEHOLDER` は、**画像がある問題でも報告します**。
 図だけが取り込まれて、同じ問題に付いていたプログラムや前提の段落が
 落ちている——という不足が実際にあるためです。
+
+`OPTION_PLACEHOLDER` も同じで、**4択のうち一部にしか画像が割り当たっていない**問題を
+報告します。画像が1枚もある以上「画像が無い問題」としては見つからないためです。
+判定には実際の選択肢テキストを使うので、A・C・Dが文字の選択肢でBだけ画像、という
+正常な問題は報告しません。
 
 その代わり、空欄そのものが図の中に描かれている問題では
 `BLANK_NOT_FOUND` が誤って付くことがあります。
@@ -85,6 +90,16 @@ EXAM-A3-Q009     NEEDS_PROGRAM+BLANK_NOT_FOUND  412          true       き     
 | 2 | DL-FFN | EXAM-A2-Q059 EXAM-A2-Q060 |
 | 2 | DL-GEN | EXAM-A3-Q017 EXAM-A3-Q018 |
 | 2 | APP-LEARN | EXAM-B3-Q017 EXAM-B3-Q018 |
+
+### 選択肢画像が4つそろっていない問題
+
+`src/ImageManifest.gs` と `data/image_audit.csv` を突き合わせると、
+**`EXAM-A2-Q027`** だけが `image_type=options`（選択肢そのものが画像）でありながら、
+選択肢Bぶんの画像しか登録されていません。
+A・C・Dが `[Aの画像選択肢]` のような目印のままなら、選ぶ材料が無い状態です
+（この場合、`runQuestionContentAudit()` が `OPTION_PLACEHOLDER` として報告し、
+アプリ側は出題しません）。A・C・Dが文字の選択肢なら正常なので、
+台帳の `option_a` `option_c` `option_d` を確認してください。
 
 太字の2グループは、報告のあった
 「図1・図2（Cross Entropy / Softmax / Affine）＋ `プログラム中の（き）`」の問題が
