@@ -950,6 +950,178 @@ function writeGenreOptionsCache_(data) {
   }
 }
 
+/* ------------------- ジャンル選択肢に出てこない論点の点検 -------------------
+ *
+ * 「最適化のような論点が出題ジャンルに出てこない」を調べるための道具。
+ * スプレッドシートを読むだけで、出題・採点・理解度・学習ログには一切触れない。
+ *
+ * 出題ジャンルの選択肢は getGenreOptions が作っていて、条件は2つだけ:
+ *   1. 02_マインドマップ の progress_eligible が TRUE（＝葉ノード）
+ *   2. 03_問題台帳 に primary_node_id がその node_id の正式問題が1問以上ある
+ *      （isFormalQuestion_ ＝ verified / active / 本文と正解がある）
+ * どちらかを外した論点は、問題を持っていても選択肢に出ない。
+ * ここではその「どちらで外れたか」を論点ごとに1行で出す。
+ *
+ * ジャンルは論点（level=2）単位なので、それより細かい主題
+ * （例: ある論点の中の「最適化」だけ）は、そもそも選択肢になり得ない。
+ * また判定は primary_node_id だけなので、secondary_node_ids でその論点に
+ * 紐づいているだけの問題は、その論点を選んでも出ない。
+ * 数え方を変えずに、その両方が数字で見えるようにしておく。
+ */
+
+/** 選択肢に出ない理由。画面には出さず、点検の結果としてだけ使う。 */
+const GENRE_DIAGNOSTIC_REASONS = Object.freeze({
+  OK: 'OK',                                   // 選択肢に出ている
+  NO_NODE_ID: 'NO_NODE_ID',                   // node_id が空の行
+  NOT_ELIGIBLE: 'NOT_PROGRESS_ELIGIBLE',      // 大分類の行など、葉ノードでない
+  ID_MISMATCH: 'NODE_ID_MISMATCH',            // 台帳側のIDと表記だけが違う
+  NO_FORMAL: 'NO_FORMAL_QUESTION',            // 問題はあるが正式問題が0問
+  NO_QUESTION: 'NO_QUESTION'                  // primaryで紐づく問題が1問もない
+});
+
+/**
+ * ジャンル選択肢の点検。読み取りだけで、どのシートにも書き込まない。
+ *
+ * 返す・出すのは論点と件数だけで、問題文も正解もここへは載せない。
+ */
+function runGenreOptionDiagnostics() {
+  const tally = tallyQuestionsByPrimaryNode_();
+  const nodes = readColumns_(APP_CONFIG.SHEETS.MINDMAP, MINDMAP_PICK_COLUMNS, { maxGap: 8 });
+
+  // 表記ゆれ（前後の空白・大文字小文字）だけが違うIDを見つけるための対応表。
+  const byNormalized = {};
+  Object.keys(tally).forEach(id => {
+    const key = normalizeNodeKey_(id);
+    if (!byNormalized[key]) byNormalized[key] = [];
+    byNormalized[key].push(id);
+  });
+
+  const rows = nodes.map(node => {
+    const nodeId = String(node.node_id == null ? '' : node.node_id);
+    const eligible = truthy_(node.progress_eligible);
+    const exact = tally[nodeId] || { total: 0, formal: 0 };
+    const sameKeyIds = (byNormalized[normalizeNodeKey_(nodeId)] || []).filter(id => id !== nodeId);
+    const nearFormal = sameKeyIds.reduce((sum, id) => sum + tally[id].formal, 0);
+
+    let reason = GENRE_DIAGNOSTIC_REASONS.OK;
+    if (!nodeId.trim()) reason = GENRE_DIAGNOSTIC_REASONS.NO_NODE_ID;
+    else if (!eligible) reason = GENRE_DIAGNOSTIC_REASONS.NOT_ELIGIBLE;
+    else if (exact.formal > 0) reason = GENRE_DIAGNOSTIC_REASONS.OK;
+    else if (nearFormal > 0) reason = GENRE_DIAGNOSTIC_REASONS.ID_MISMATCH;
+    else if (exact.total > 0) reason = GENRE_DIAGNOSTIC_REASONS.NO_FORMAL;
+    else reason = GENRE_DIAGNOSTIC_REASONS.NO_QUESTION;
+
+    return {
+      node_id: nodeId,
+      topic: String(node.topic || ''),
+      major_area: String(node.major_area || '').trim() || GENRE_UNKNOWN_LABEL,
+      progress_eligible: eligible,
+      shown_in_picker: reason === GENRE_DIAGNOSTIC_REASONS.OK,
+      reason: reason,
+      // 03_問題台帳を primary_node_id で数え直した値（＝出題側と同じ数え方）。
+      ledger_questions: exact.total,
+      ledger_formal_questions: exact.formal,
+      // 02_マインドマップ側の数え方。ずれていたら数式かIDのどちらかが古い。
+      sheet_verified_questions: numberOrZero_(node.primary_verified_question_count),
+      // 表記だけが違うIDが台帳にあるとき、その相手をそのまま出す。
+      similar_ledger_node_ids: sameKeyIds.join(',')
+    };
+  });
+
+  // 台帳にはあるのに、02_マインドマップのどの行とも一致しない primary_node_id。
+  // ここに正式問題が残っていると、その問題はどのジャンルからも選べない。
+  const knownIds = {};
+  nodes.forEach(node => { knownIds[String(node.node_id == null ? '' : node.node_id)] = true; });
+  const orphans = Object.keys(tally)
+    .filter(id => id.trim() && !knownIds[id] && tally[id].formal > 0)
+    .map(id => ({ primary_node_id: id, formal_questions: tally[id].formal }))
+    .sort((a, b) => b.formal_questions - a.formal_questions);
+
+  const shown = rows.filter(r => r.shown_in_picker);
+  const hidden = rows.filter(r => !r.shown_in_picker && r.ledger_formal_questions > 0);
+  const summary = {
+    mindmap_rows: rows.length,
+    shown_genres: shown.length,
+    shown_formal_questions: shown.reduce((sum, r) => sum + r.ledger_formal_questions, 0),
+    // 「選択肢に出ないのに正式問題を持っている」論点と、その問題数。
+    hidden_nodes: hidden.length,
+    hidden_formal_questions: hidden.reduce((sum, r) => sum + r.ledger_formal_questions, 0),
+    orphan_node_ids: orphans.length,
+    orphan_formal_questions: orphans.reduce((sum, o) => sum + o.formal_questions, 0)
+  };
+
+  // 大分類ごとの内訳。丸ごと1つ消えている大分類はここで分かる。
+  const areas = [];
+  const byArea = {};
+  rows.forEach(r => {
+    if (!byArea[r.major_area]) {
+      byArea[r.major_area] = { major_area: r.major_area, shown: 0, hidden: 0, hidden_formal: 0 };
+      areas.push(byArea[r.major_area]);
+    }
+    if (r.shown_in_picker) byArea[r.major_area].shown++;
+    else if (r.ledger_formal_questions > 0) {
+      byArea[r.major_area].hidden++;
+      byArea[r.major_area].hidden_formal += r.ledger_formal_questions;
+    }
+  });
+
+  console.log('出題ジャンルに出ている論点: ' + summary.shown_genres + '件 / '
+    + summary.shown_formal_questions + '問');
+  console.log('出ていないのに正式問題を持つ論点: ' + summary.hidden_nodes + '件 / '
+    + summary.hidden_formal_questions + '問');
+  console.log('02_マインドマップに無い primary_node_id: ' + summary.orphan_node_ids + '件 / '
+    + summary.orphan_formal_questions + '問');
+  console.log('--- 大分類ごと（出ている論点 / 出ていない論点・問題数） ---');
+  areas.forEach(a => {
+    console.log([a.major_area, a.shown, a.hidden, a.hidden_formal].join('\t'));
+  });
+  console.log('--- 論点ごと（以下をコピーして共有してください） ---');
+  console.log(['node_id', 'topic', 'major_area', 'reason', 'eligible',
+    'ledger_formal', 'ledger_all', 'sheet_verified', 'similar_ids'].join('\t'));
+  rows.forEach(r => {
+    console.log([
+      r.node_id, r.topic, r.major_area, r.reason, r.progress_eligible,
+      r.ledger_formal_questions, r.ledger_questions, r.sheet_verified_questions,
+      r.similar_ledger_node_ids
+    ].join('\t'));
+  });
+  orphans.forEach(o => {
+    console.log([o.primary_node_id, '(02_マインドマップに行が無い)', '', 'ORPHAN_NODE_ID',
+      false, o.formal_questions, o.formal_questions, 0, ''].join('\t'));
+  });
+
+  return {
+    ok: true,
+    summary: summary,
+    areas: areas,
+    nodes: rows,
+    orphans: orphans,
+    note: 'この点検は読み取りだけです。02_マインドマップにも03_問題台帳にも04_学習ログにも書き込みません。'
+  };
+}
+
+/**
+ * 03_問題台帳を primary_node_id ごとに数える。
+ *
+ * 読む列も正式問題の判定も getGenreOptions とまったく同じにする。
+ * ここで別の数え方を作ると、点検結果と実際の選択肢がずれてしまう。
+ */
+function tallyQuestionsByPrimaryNode_() {
+  const tally = {};
+  readColumns_(APP_CONFIG.SHEETS.QUESTIONS, GENRE_OPTION_QUESTION_COLUMNS).forEach(q => {
+    const nodeId = String(q.primary_node_id == null ? '' : q.primary_node_id);
+    if (!tally[nodeId]) tally[nodeId] = { total: 0, formal: 0 };
+    tally[nodeId].total++;
+    if (isFormalQuestion_(q)) tally[nodeId].formal++;
+  });
+  return tally;
+}
+
+/** 表記ゆれの比較だけに使う。出題側の一致判定はこれまでどおり文字列そのまま。 */
+function normalizeNodeKey_(value) {
+  return String(value == null ? '' : value).trim().toUpperCase();
+}
+
 /**
  * クライアントから届いたジャンル指定を、絞り込みに使える形へ直す。
  * 空・未指定・ALL は「すべてのジャンル」＝絞り込みなし（既存動作のまま）。
