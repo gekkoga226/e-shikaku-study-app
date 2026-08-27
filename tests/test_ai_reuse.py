@@ -158,8 +158,15 @@ const makeCache = () => ({
 });
 const CacheService = { getUserCache: makeCache, getScriptCache: makeCache };
 
+// スクリプトプロパティ。保存まわりの不具合の記録もここへ入る。
+// 名前は他のテストのハーネス（test_ai_quota_fallback）と重ならないものにする。
+const REUSE_PROPS = new Map([['GEMINI_API_KEY', 'test-key']]);
 const PropertiesService = {
-  getScriptProperties: () => ({ getProperty: k => (k === 'GEMINI_API_KEY' ? 'test-key' : '') })
+  getScriptProperties: () => ({
+    getProperty: k => (REUSE_PROPS.has(k) ? REUSE_PROPS.get(k) : ''),
+    setProperty: (k, v) => { REUSE_PROPS.set(k, v); },
+    deleteProperty: k => { REUSE_PROPS.delete(k); }
+  })
 };
 
 const Utilities = {
@@ -203,10 +210,11 @@ callGeminiGenerateContent_ = function (model, apiKey, parts) {
 """
 
 
-def log_row(attempt_id, question_id='Q1', user_answer='A', confidence=3):
+def log_row(attempt_id, question_id='Q1', user_answer='A', confidence=3,
+            answered_at='2026-08-19 10:00:00'):
     values = {
         'attempt_id': attempt_id,
-        'answered_at': '2026-08-19 10:00:00',
+        'answered_at': answered_at,
         'session_id': 'S1',
         'question_id': question_id,
         'primary_node_id': 'N1',
@@ -239,7 +247,7 @@ def question_row(question_id='Q1', text='問題の本文です。', explanation=
     return [values.get(h, '') for h in QUESTION_HEADERS]
 
 
-def run_ai(driver, log_rows=None, question_rows=None, cache_rows=None):
+def run_ai(driver, log_rows=None, question_rows=None, cache_rows=None, extra=''):
     """AI解説まわりを実際に動かし、呼び出しと読み書きの記録を返す。"""
     script = '\n'.join([
         'const LOG_HEADERS = %s;' % js_value(LOG_HEADERS),
@@ -249,6 +257,7 @@ def run_ai(driver, log_rows=None, question_rows=None, cache_rows=None):
         'const QUESTION_ROWS = %s;' % js_value(
             question_rows if question_rows is not None else [question_row()]),
         'const CACHE_ROWS = %s;' % js_value(cache_rows),
+        extra,
         FAKE_ENV,
         gas_bundle(),
         GEMINI_STUB,
@@ -585,6 +594,126 @@ class TestClientPrefetchRules(unittest.TestCase):
     def test_source_is_shown_honestly(self):
         body = self._body('aiSourceLabel')
         self.assertIn('保存済み', body, '再表示であることを画面に出していません')
+
+
+class TestCacheCheckTellsTheTruth(unittest.TestCase):
+    """「保存されているか」「引き出せているか」を、あとから確かめられること。"""
+
+    def setUp(self):
+        require_node(self)
+
+    def test_missing_sheet_is_reported(self):
+        """シートを作れなかったときは、点検が「保存できていない」と言うこと。"""
+        out = run_ai("""
+            SpreadsheetApp.openById = () => ({
+              getSheetByName: n => SHEETS[n] || null,
+              getNumSheets: () => Object.keys(SHEETS).length,
+              insertSheet: () => { throw new Error('作れません'); }
+            });
+            SPREADSHEET_HANDLE_ = null;
+            getAiExplanation({ attemptId: 'ATT-1' });
+            const rep = checkAiExplanationCache();
+            console.log(JSON.stringify({
+              ok: rep.ok, exists: rep.sheet_exists, trouble: rep.last_trouble
+            }));
+        """, cache_rows=None)
+
+        self.assertFalse(out['ok'])
+        self.assertFalse(out['exists'])
+        self.assertIn('作れません', out['trouble'],
+                      '保存できなかった理由がどこにも残っていません')
+
+    def test_write_failure_is_recorded(self):
+        """書き込みに失敗しても黙って消えないこと。"""
+        out = run_ai("""
+            const sh = SHEETS['07_AI解説キャッシュ'];
+            const real = sh.getRange.bind(sh);
+            sh.getRange = (...a) => {
+              const range = real(...a);
+              range.setValues = () => { throw new Error('書き込めません'); };
+              return range;
+            };
+            const res = getAiExplanation({ attemptId: 'ATT-1' });
+            console.log(JSON.stringify({
+              ok: res.ok, trouble: checkAiExplanationCache().last_trouble
+            }));
+        """, cache_rows=[])
+
+        self.assertTrue(out['ok'], '保存に失敗しただけでAI解説が止まっています')
+        self.assertIn('書き込めません', out['trouble'],
+                      '書き込みの失敗が記録されていません')
+
+    def test_saved_row_is_reported_as_usable(self):
+        out = run_ai("""
+            getAiExplanation({ attemptId: 'ATT-1' });
+            const rep = checkAiExplanationCache();
+            console.log(JSON.stringify({
+              saved: rep.saved, usable: rep.usable, stale: rep.stale,
+              trouble: rep.last_trouble
+            }));
+        """, cache_rows=[])
+
+        self.assertEqual(out['saved'], 1)
+        self.assertEqual(out['usable'], 1, '残した解説が「使えない」と判定されています')
+        self.assertEqual(out['stale'], 0)
+        self.assertEqual(out['trouble'], '', '正常なのに不具合が記録されています')
+
+    def test_changed_question_is_reported_as_stale(self):
+        """問題側を書き換えたら、その解説は作り直しになると分かること。"""
+        out = run_ai("""
+            getAiExplanation({ attemptId: 'ATT-1' });
+            // 03_問題台帳の本文を直したことにする（question_text は2列目）。
+            SHEETS['03_問題台帳']._grid[1][1] = '書き換えたあとの本文';
+            const rep = checkAiExplanationCache();
+            console.log(JSON.stringify({ usable: rep.usable, stale: rep.stale }));
+        """, cache_rows=[])
+
+        self.assertEqual(out['stale'], 1,
+                         '問題側の書き換えで使えなくなったことを見つけられていません')
+        self.assertEqual(out['usable'], 0)
+
+    def test_reuse_chances_count_later_answers(self):
+        """保存したあと、同じ問題を同じ選択肢で答えた回数を数えること。"""
+        out = run_ai("""
+            getAiExplanation({ attemptId: 'ATT-1' });
+            const before = checkAiExplanationCache().reuse_chances;
+            // 保存より後の日付で、同じ問題を同じ選択肢で答えた記録を足す。
+            SHEETS['04_学習ログ']._grid.push(LATER_LOG_ROW);
+            const after = checkAiExplanationCache().reuse_chances;
+            console.log(JSON.stringify({ before: before, after: after }));
+        """, cache_rows=[], extra="const LATER_LOG_ROW = %s;" % js_value(
+            log_row('ATT-9', answered_at='2099-01-01 10:00:00')))
+
+        self.assertEqual(out['before'], 0,
+                         '保存より前の回答を「出番」に数えています')
+        self.assertEqual(out['after'], 1,
+                         '保存より後の回答を数えられていません')
+
+    def test_check_writes_nothing_to_the_sheets(self):
+        """点検は読むだけで、どのシートへも書かないこと。"""
+        out = run_ai("""
+            getAiExplanation({ attemptId: 'ATT-1' });
+            WRITES.length = 0;
+            checkAiExplanationCache();
+            console.log(JSON.stringify({ written: WRITES.map(w => w.sheet) }));
+        """, cache_rows=[])
+
+        self.assertEqual(out['written'], [], '点検がシートへ書き込んでいます')
+
+    def test_check_does_not_read_the_text_column_in_bulk(self):
+        """本文の列を全行まとめて読まないこと（1セルが数千文字あるため）。"""
+        out = run_ai("""
+            getAiExplanation({ attemptId: 'ATT-1' });
+            READS.length = 0;
+            checkAiExplanationCache();
+            const bulk = READS.filter(r => r.sheet === '07_AI解説キャッシュ' && r.numRows > 1);
+            console.log(JSON.stringify({
+              widest: bulk.reduce((m, r) => Math.max(m, r.col + r.numCols - 1), 0)
+            }));
+        """, cache_rows=[])
+
+        self.assertLessEqual(out['widest'], 5,
+                             '複数行の読み取りが本文の列（6列目）まで届いています')
 
 
 if __name__ == '__main__':

@@ -1877,6 +1877,15 @@ const AI_CONFIG = Object.freeze({
   SHEET_HEADERS: ['question_id', 'user_answer', 'source_signature', 'model', 'generated_at',
                   'explanation_text', 'prompt_version'],
   /*
+   * 解説を残せなかったときの理由を書いておく場所。
+   *
+   * 保存まわりはどこで失敗しても学習を止めない約束なので、すべて黙って諦める。
+   * そのぶん「保存できていない」ことに誰も気づけなかった。
+   * ここへ最後の理由だけを残し、checkAiExplanationCache() から読めるようにする。
+   * 学習データとは無関係で、無くても動作は変わらない。
+   */
+  TROUBLE_PROPERTY: 'AI_CACHE_LAST_TROUBLE',
+  /*
    * 解説の書き方（AI_SYSTEM_INSTRUCTION）の版。
    *
    * 残した解説がどの指示で作られたかを記録しておくための印で、
@@ -2081,6 +2090,30 @@ function getAiExplanation(request) {
  */
 
 /**
+ * 解説を残せなかった／読めなかった理由を控えておく。
+ *
+ * 保存まわりは失敗しても学習を止めない。ただし黙って諦めるだけだと、
+ * 「毎回作り直している」のが仕様なのか故障なのか、外からは区別できない。
+ * ここで実行ログとスクリプトプロパティの両方へ最後の理由を残し、
+ * checkAiExplanationCache() から読めるようにする。
+ *
+ * 記録そのものが失敗しても、呼び出し元の動きは変えない（例外を外へ出さない）。
+ */
+function aiRecordCacheTrouble_(where, detail) {
+  const line = formatDateTime_(new Date()) + '  ' + String(where) + ': ' + String(detail || '');
+  try {
+    console.warn('AI解説キャッシュ ' + line);
+  } catch (e) {
+    // ログへ出せなくても続ける。
+  }
+  try {
+    PropertiesService.getScriptProperties().setProperty(AI_CONFIG.TROUBLE_PROPERTY, line);
+  } catch (e) {
+    // 記録できなくても、これまでどおり毎回生成へ戻るだけ。
+  }
+}
+
+/**
  * 解説の中身を決めている材料の署名。
  *
  * 自信度は含めない。プロンプトには入るが、システム指示が言及を禁じているので
@@ -2108,6 +2141,8 @@ function aiSourceSignature_(question, userAnswer) {
     return digest.map(b => ((b < 0 ? b + 256 : b).toString(16)).padStart(2, '0')).join('').slice(0, 32);
   } catch (e) {
     // 署名を作れないときは「毎回作り直す」側へ倒す（古い内容を出し続けない）。
+    // ただし署名が作れない＝1件も保存できないということなので、理由は残す。
+    aiRecordCacheTrouble_('署名の計算', aiErrorText_(e));
     return '';
   }
 }
@@ -2128,6 +2163,7 @@ function aiSheet_(createIfMissing) {
     sh.setFrozenRows(1);
     return sh;
   } catch (e) {
+    aiRecordCacheTrouble_(createIfMissing ? 'シートの用意' : 'シートを開く', aiErrorText_(e));
     return null;
   }
 }
@@ -2154,6 +2190,7 @@ function aiEnsureSheetColumns_(sh) {
     }
   } catch (e) {
     // 列を足せなくても、これまでの列だけで動く。
+    aiRecordCacheTrouble_('見出しの列そろえ', aiErrorText_(e));
   }
   return sh;
 }
@@ -2216,6 +2253,7 @@ function aiSheetLookup_(questionId, userAnswer, signature) {
     }
     return null;
   } catch (e) {
+    aiRecordCacheTrouble_('保存済み解説の読み出し', aiErrorText_(e));
     return null;
   }
 }
@@ -2225,8 +2263,19 @@ function aiSheetLookup_(questionId, userAnswer, signature) {
  * 失敗しても解説はもう画面へ返せるので、静かに諦める。
  */
 function aiSheetSave_(questionId, userAnswer, signature, model, text) {
-  if (!questionId || !userAnswer || !signature) return;
-  if (!text || text.length > AI_CONFIG.MAX_SHEET_CHARS) return;
+  // ここで諦めると1件も残らない。どの条件で諦めたのかを残しておく。
+  if (!questionId || !userAnswer || !signature) {
+    aiRecordCacheTrouble_('保存の前提', 'question_id / user_answer / 署名 のどれかが空です'
+      + '（question_id=' + String(questionId) + ' user_answer=' + String(userAnswer)
+      + ' 署名=' + (signature ? 'あり' : 'なし') + '）');
+    return;
+  }
+  if (!text || text.length > AI_CONFIG.MAX_SHEET_CHARS) {
+    aiRecordCacheTrouble_('保存の前提',
+      '本文が空か、上限（' + AI_CONFIG.MAX_SHEET_CHARS + '文字）を超えています（'
+      + String(text ? text.length : 0) + '文字）');
+    return;
+  }
 
   try {
     const sh = aiSheet_(true);
@@ -2252,6 +2301,7 @@ function aiSheetSave_(questionId, userAnswer, signature, model, text) {
     sh.getRange(target, 5).setNumberFormat('yyyy-mm-dd hh:mm:ss');
   } catch (e) {
     // 残せなくても、次に開いたとき作り直せばよい。
+    aiRecordCacheTrouble_('解説の書き込み', aiErrorText_(e));
   }
 }
 
@@ -3007,6 +3057,155 @@ function clearAiQuotaBlock() {
   PropertiesService.getScriptProperties().deleteProperty(AI_CONFIG.QUOTA_STATE_PROPERTY);
   console.log('AI利用枠の休止記録を消しました。次の1回から主モデルを試します。');
   return { ok: true };
+}
+
+/** 保存まわりで最後に起きた不具合の記録（無ければ空文字）。 */
+function aiCacheTroubleNote_() {
+  try {
+    return String(
+      PropertiesService.getScriptProperties().getProperty(AI_CONFIG.TROUBLE_PROPERTY) || ''
+    );
+  } catch (e) {
+    return '';
+  }
+}
+
+/**
+ * AI補助解説が「本当に保存されているか」「保存したものを引き出せているか」を調べる。
+ *
+ * Apps Script のエディタから実行して、実行ログを読む。
+ * 読むだけで、シートへは1文字も書かない（AIも呼ばない）。
+ *
+ * 見るのはこの4つ。
+ *   1. 保存先の 07_AI解説キャッシュ があるか（無い＝一度も保存できていない）
+ *   2. 何件残っているか
+ *   3. 1件ずつ「いま」使い回せるか
+ *      （問題文・選択肢・登録解説が書き換わると署名が変わり、使えなくなる）
+ *   4. 保存したあとに、同じ問題を同じ選択肢で答え直した回数
+ *      ＝使い回しの出番が実際に何回あったか。ここが0なら、
+ *        保存はできていても再表示は起きようがない
+ */
+const AI_CACHE_CHECK_ROWS = 50;
+
+function checkAiExplanationCache() {
+  const report = {
+    ok: true, sheet_exists: false, saved: 0, checked: 0,
+    usable: 0, stale: 0, question_missing: 0, reuse_chances: 0,
+    last_trouble: aiCacheTroubleNote_(), rows: []
+  };
+
+  const sh = aiSheet_(false);
+  if (!sh) {
+    report.ok = false;
+    console.log('保存先シート「' + AI_CONFIG.SHEET + '」がありません。');
+    console.log('＝AI解説は一度も保存できていません。毎回作り直しになります。');
+    aiLogCacheTrouble_(report);
+    return report;
+  }
+  report.sheet_exists = true;
+
+  const lastRow = sh.getLastRow();
+  report.saved = Math.max(lastRow - 1, 0);
+  console.log('保存先シート: あり（保存 ' + report.saved + '件）');
+  if (!report.saved) {
+    console.log('＝表はあるのに1件も残っていません。書き込みのたびに失敗している疑いがあります。');
+    aiLogCacheTrouble_(report);
+    return report;
+  }
+
+  // 本文の列（6列目）は行数ぶんまとめて読まない。短いキー列だけを読む。
+  const width = Math.max(3, Math.min(5, sh.getLastColumn()));
+  const keys = sh.getRange(2, 1, lastRow - 1, width).getValues();
+  const recent = keys.slice(-AI_CACHE_CHECK_ROWS);
+
+  const answeredAt = aiAnswerTimesByQuestionAndOption_();
+  const qSheet = spreadsheet_().getSheetByName(APP_CONFIG.SHEETS.QUESTIONS);
+  const questions = {};
+
+  recent.forEach(key => {
+    const qid = String(key[0] || '').trim();
+    const userAnswer = String(key[1] || '').trim().toUpperCase();
+    if (!qid || !userAnswer) return;
+    report.checked++;
+
+    if (!(qid in questions)) {
+      questions[qid] = qSheet ? findObjectById_(qSheet, 'question_id', qid) : null;
+    }
+    const question = questions[qid];
+
+    let state;
+    if (!question) {
+      state = '問題台帳に無い';
+      report.question_missing++;
+    } else if (aiSourceSignature_(question, userAnswer) === String(key[2] || '')) {
+      state = '使える';
+      report.usable++;
+    } else {
+      // 問題側が書き換わっている。古い解説を出し続けないための正しい動きだが、
+      // 台帳をよく直しているなら、これが再表示されない原因になり得る。
+      state = '問題側が変わったので作り直し';
+      report.stale++;
+    }
+
+    const generatedAt = width >= 5 ? dateFromCell_(key[4]) : null;
+    const times = answeredAt[qid + '\u0000' + userAnswer] || [];
+    const after = generatedAt
+      ? times.filter(t => t > generatedAt.getTime()).length
+      : times.length;
+    report.reuse_chances += after;
+
+    report.rows.push({
+      question_id: qid, user_answer: userAnswer, state: state,
+      generated_at: generatedAt ? formatDateTime_(generatedAt) : '',
+      answered_again: after
+    });
+  });
+
+  console.log('直近' + report.checked + '件の内訳: 使える ' + report.usable +
+              ' / 問題側が変わって作り直し ' + report.stale +
+              ' / 問題台帳に無い ' + report.question_missing);
+  console.log('保存後に同じ問題を同じ選択肢で答え直した回数（＝再表示の出番）: ' +
+              report.reuse_chances + '回');
+  if (!report.reuse_chances) {
+    console.log('＝保存はできていても、まだ一度も出番が来ていません。');
+    console.log('  使い回しの条件は question_id と選んだ選択肢の両方が同じことです。');
+    console.log('  間違えた問題を解き直して今度は正解した場合は、選択肢が変わるので別あつかいになります。');
+  }
+  report.rows.slice(-10).forEach(row => {
+    console.log('  ' + row.question_id + ' / ' + row.user_answer + ' / ' + row.state +
+                ' / 作成 ' + (row.generated_at || '不明') +
+                ' / その後の同じ回答 ' + row.answered_again + '回');
+  });
+  aiLogCacheTrouble_(report);
+  return report;
+}
+
+function aiLogCacheTrouble_(report) {
+  if (report.last_trouble) {
+    console.log('保存まわりで最後に起きたこと: ' + report.last_trouble);
+  } else {
+    console.log('保存まわりの失敗記録: なし');
+  }
+}
+
+/**
+ * 04_学習ログから「どの問題をどの選択肢で、いつ答えたか」だけを集める。
+ *
+ * 正誤も理解度も見ない。使い回しの出番が何回あったかを数えるためだけに使う。
+ */
+function aiAnswerTimesByQuestionAndOption_() {
+  const out = {};
+  readColumns_(APP_CONFIG.SHEETS.LOG, ['question_id', 'user_answer', 'answered_at'])
+    .forEach(row => {
+      const qid = String(row.question_id || '').trim();
+      const userAnswer = String(row.user_answer || '').trim().toUpperCase();
+      if (!qid || !userAnswer) return;
+      const at = dateFromCell_(row.answered_at);
+      if (!at) return;
+      const key = qid + '\u0000' + userAnswer;
+      (out[key] = out[key] || []).push(at.getTime());
+    });
+  return out;
 }
 
 /* ----------------------------- internal helpers ----------------------------- */
